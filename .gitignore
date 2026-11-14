@@ -1,0 +1,10 @@
+# Instrumented copies the debugger writes next to a script while it runs
+~dbg_*
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS noise
+.vscode/
+Thumbs.db
