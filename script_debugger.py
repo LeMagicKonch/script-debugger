@@ -1669,9 +1669,11 @@ DEBUGGER_PRESETS = [
     ("dnSpy (then Debug > Attach to Process)", "dnSpy.exe"),
     ("Custom", ""),
 ]
+MANAGED_DEBUGGER_NAMES = ("dnspy", "ilspy", "dotpeek", "visual studio", "vsdbg", "devenv")
+
 DEFAULT_SETTINGS = {"native_template": DEBUGGER_PRESETS[0][1], "attach_at_start": False, "asm_pause": False,
                     "guard": False, "guard_created": False, "guard_first": True, "guard_dlls": False,
-                    "guard_ignore": "conhost.exe"}
+                    "guard_ignore": "conhost.exe", "guard_template": DEBUGGER_PRESETS[0][1]}
 
 
 def _settings_path():
@@ -3036,9 +3038,18 @@ class DebuggerApp(tk.Tk):
         def handoff():
             session.guard_command("detach", pid)
             state["detached"] = True
-            template = (self.settings.get("native_template") or "").strip()
+            template = (self.settings.get("guard_template") or "").strip()
             launched = False
             if template:
+                if any(name in template.lower() for name in MANAGED_DEBUGGER_NAMES):
+                    msg.configure(text=(
+                        f"The configured process-guard debugger ({template}) is a .NET/managed debugger. It cannot "
+                        f"attach to or debug this native process ({os.path.basename(image)}, PID {pid}); it will "
+                        f"open but do nothing, and pressing Resume would just let the process run unwatched. Set a "
+                        f"native debugger (WinDbg or x64dbg) for 'Process guard hand-off' in Native debugger "
+                        f"settings, then try again, or attach one manually to PID {pid} now — it stays frozen "
+                        f"either way."), foreground="#c42c1c")
+                    return
                 cmd = template.replace("{pid}", str(pid))
                 try:
                     subprocess.Popen(cmd)
@@ -3046,9 +3057,11 @@ class DebuggerApp(tk.Tk):
                     self._append_output(f"[debugger] launched: {cmd}\n", "dbg")
                 except OSError as exc:
                     self._append_output(f"[debugger] could not start the debugger ({exc}); attach manually to PID {pid}\n", "dbg")
-            msg.configure(text=(f"Detached. {'Debugger launched for' if launched else 'Attach your debugger to'} PID {pid}. "
-                                f"The process stays frozen until you press Resume here (or resume its thread in the "
-                                f"debugger: WinDbg ~*m, x64dbg thread list)."))
+            msg.configure(foreground="#1f4fb8", text=(
+                f"Detached. {'Debugger launched for' if launched else 'Attach a NATIVE debugger (WinDbg/x64dbg) to'} "
+                f"PID {pid}. The thread is held suspended the whole time, so the debugger will show it sitting at "
+                f"the frozen address — no breakpoint needed. Press Resume here only once it is attached (or "
+                f"resume its thread yourself: WinDbg ~*m, x64dbg thread list)."))
             b_handoff.state(["disabled"])
 
         def resume():
@@ -3107,7 +3120,9 @@ class DebuggerApp(tk.Tk):
         for label, tmpl in DEBUGGER_PRESETS:
             if tmpl and tmpl == tmpl_var.get():
                 preset_var.set(label)
-        ttk.Label(frm, text="Debugger command ({pid} is replaced by the script's process ID):").grid(
+        ttk.Label(frm, text="For 'Attach debugger' / attach-at-start ({pid} is replaced by the process ID). This "
+                           "process is PowerShell or cmd.exe itself, so a managed debugger like dnSpy is fine if "
+                           "you only want to inspect .NET assemblies it loads:").grid(
             row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(frm, text="Preset:").grid(row=1, column=0, sticky="w", pady=(6, 0))
         preset = ttk.Combobox(frm, textvariable=preset_var, state="readonly", width=44,
@@ -3145,6 +3160,28 @@ class DebuggerApp(tk.Tk):
         gifrm.grid(row=7, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(4, 0))
         ttk.Label(gifrm, text="Never freeze these images (comma-separated):").pack(side="left")
         ttk.Entry(gifrm, textvariable=gi_var, width=36).pack(side="left", padx=(6, 0))
+        gtmpl_var = tk.StringVar(value=self.settings.get("guard_template") or "")
+        gpreset_var = tk.StringVar(value="Custom")
+        for label, tmpl in DEBUGGER_PRESETS:
+            if tmpl and tmpl == gtmpl_var.get():
+                gpreset_var.set(label)
+        ttk.Label(frm, text="For process guard hand-off — this freezes a NATIVE process (child, hollowed "
+                           "target), so this MUST be a native debugger (WinDbg or x64dbg), never dnSpy or another "
+                           "managed/.NET debugger: it cannot attach to or stop a native process at all.",
+                  foreground="#c42c1c", wraplength=620, justify="left").grid(
+            row=8, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        ttk.Label(frm, text="Preset:").grid(row=9, column=0, sticky="w", pady=(6, 0))
+        gpreset = ttk.Combobox(frm, textvariable=gpreset_var, state="readonly", width=44,
+                               values=[p[0] for p in DEBUGGER_PRESETS if "dnSpy" not in p[0]])
+        gpreset.grid(row=9, column=1, sticky="w", pady=(6, 0))
+
+        def on_gpreset(event=None):
+            for label, tmpl in DEBUGGER_PRESETS:
+                if label == gpreset_var.get() and tmpl:
+                    gtmpl_var.set(tmpl)
+        gpreset.bind("<<ComboboxSelected>>", on_gpreset)
+        ttk.Label(frm, text="Command:").grid(row=10, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(frm, textvariable=gtmpl_var, width=70).grid(row=10, column=1, sticky="w", pady=(6, 0))
         ttk.Label(frm, foreground="#7a8290", justify="left", wraplength=620, text=(
             "WinDbg: .childdbg 1 debugs every child process the script creates (including ones created suspended "
             "for hollowing); sxe cpr breaks on each process creation. Add sxe ld:<name> or bp ntdll!NtMapViewOfSection "
@@ -3156,10 +3193,12 @@ class DebuggerApp(tk.Tk):
             "and is about to run it; 'creation' is before the creator has touched it. While the guard is on, no "
             "other debugger can attach to the script process itself (Windows allows one debugger per process); "
             "handing off a child detaches the guard from that child only. The script process sees "
-            "IsDebuggerPresent() = true. Takes effect on the next run.")).grid(
-            row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            "IsDebuggerPresent() = true. Takes effect on the next run. The thread stays suspended the whole time "
+            "it is frozen, including after hand-off, so whichever debugger attaches will show it sitting at that "
+            "address already — attaching is enough, no breakpoint is needed to 'catch' it.")).grid(
+            row=11, column=0, columnspan=2, sticky="w", pady=(10, 0))
         btns = ttk.Frame(frm)
-        btns.grid(row=9, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        btns.grid(row=12, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         def save():
             self.settings["native_template"] = tmpl_var.get().strip()
@@ -3170,6 +3209,7 @@ class DebuggerApp(tk.Tk):
             self.settings["guard_first"] = bool(gf_var.get())
             self.settings["guard_dlls"] = bool(gd_var.get())
             self.settings["guard_ignore"] = gi_var.get().strip()
+            self.settings["guard_template"] = gtmpl_var.get().strip()
             save_settings(self.settings)
             if self.session:
                 self.session.asm_pause = self.settings["asm_pause"] and self.kind == "powershell"
