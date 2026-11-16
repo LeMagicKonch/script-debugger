@@ -871,6 +871,13 @@ LOAD_DLL_DEBUG_EVENT = 6
 UNLOAD_DLL_DEBUG_EVENT = 7
 OUTPUT_DEBUG_STRING_EVENT = 8
 BREAKPOINT_CODES = (0x80000003, 0x4000001F)      # EXCEPTION_BREAKPOINT, STATUS_WX86_BREAKPOINT
+# The CLR raises this first-chance exception as a synchronization beacon once its debugging
+# data structures are valid, specifically so a native debugger knows it is now safe to attach
+# a managed debugger (this is how WinDbg's SOS and Visual Studio's mixed-mode debugger decide
+# when to switch over). It fires well after clr.dll/coreclr.dll loads but well before any
+# managed code, including the payload's own assemblies, is loaded or run -- confirmed by
+# tracing every debug event against a real CLR v4.0.30319 process. Always continue past it.
+CLR_NOTIFICATION_EXCEPTION_CODE = 0x04242420
 THREAD_SUSPEND_RESUME = 0x0002
 PROCESS_TERMINATE = 0x0001
 
@@ -950,7 +957,6 @@ class ProcessGuard:
     STAGE_CREATED = "created"
     STAGE_FIRST = "first"
     STAGE_CLR = "clr"
-    CLR_DLLS = {"clr.dll", "coreclr.dll", "mscorwks.dll"}   # .NET Framework / .NET Core / legacy CLR 2.0
 
     def __init__(self, events, stages, log_dlls=False, ignore=("conhost.exe",)):
         self.events = events
@@ -1104,22 +1110,16 @@ class ProcessGuard:
     def _on_load_dll(self, pid, tid, dll):
         """Fires for every DLL any guarded process loads, including a hollowed one, since
         Windows delivers it to whichever process is the active debugger regardless of how
-        the thread got there. clr.dll/coreclr.dll loading is how we catch a .NET payload
-        before any of its managed code runs, including when a hollowing loader redirects
-        the thread's entry point directly and so never hits the native 'first instruction'
-        trap: the redirected code still has to load the CLR to run .NET code at all, and
-        that load is always visible here.
+        the thread got there. Only used for logging here; the CLR-load freeze itself happens
+        on the notification exception in _on_exception, which fires later than this (once
+        the runtime has registered itself as attachable) but still well before any managed
+        code runs.
         """
-        path = _path_from_handle(dll.hFile) if (self.log_dlls or self.STAGE_CLR in self.stages) else ""
+        path = _path_from_handle(dll.hFile) if self.log_dlls else ""
         if dll.hFile:
             _k32.CloseHandle(dll.hFile)
         if self.log_dlls and pid != self.root_pid:
             self._log(f"[guard] PID {pid} loaded {path or '<unknown dll>'}")
-        info = self.procs.get(pid)
-        if (info and pid != self.root_pid and self.STAGE_CLR in self.stages and not info.get("ignored")
-                and not info.get("clr_frozen") and os.path.basename(path).lower() in self.CLR_DLLS):
-            info["clr_frozen"] = True
-            self._freeze(pid, tid, self.STAGE_CLR)
 
     def _on_exit(self, pid, code):
         info = self.procs.pop(pid, None)
@@ -1137,6 +1137,12 @@ class ProcessGuard:
                 info["init_bp_pending"] = False
                 if pid != self.root_pid and self.STAGE_FIRST in self.stages and not info.get("ignored"):
                     self._freeze(pid, tid, self.STAGE_FIRST)
+            return DBG_CONTINUE
+        if code == CLR_NOTIFICATION_EXCEPTION_CODE:
+            if (info and pid != self.root_pid and self.STAGE_CLR in self.stages and not info.get("ignored")
+                    and not info.get("clr_frozen")):
+                info["clr_frozen"] = True
+                self._freeze(pid, tid, self.STAGE_CLR)
             return DBG_CONTINUE
         return DBG_EXCEPTION_NOT_HANDLED
 
@@ -3036,7 +3042,8 @@ class DebuggerApp(tk.Tk):
         pid, image, parent = info["pid"], info["image"], info["parent"]
         is_clr = stage == ProcessGuard.STAGE_CLR
         if is_clr:
-            when = "right as it loaded the .NET runtime (clr.dll/coreclr.dll mapped; no managed code has run yet)"
+            when = ("right as the .NET runtime registered itself as attachable (clr.dll/coreclr.dll has started "
+                   "but no managed code, including the payload's own assemblies, has run yet)")
         elif stage == ProcessGuard.STAGE_FIRST:
             when = "at its first instruction (image mapped, nothing executed yet)"
         else:
@@ -3193,7 +3200,7 @@ class DebuggerApp(tk.Tk):
         gfrm2 = ttk.Frame(frm)
         gfrm2.grid(row=7, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(2, 0))
         ttk.Checkbutton(gfrm2, text="log native DLL loads", variable=gd_var).pack(side="left")
-        ttk.Label(gfrm2, text="(most .NET payloads load clr.dll/coreclr.dll: freeze there and attach dnSpy)",
+        ttk.Label(gfrm2, text="(.NET/CLR load freezes once the runtime is attach-ready, before the payload runs)",
                   foreground="#7a8290").pack(side="left", padx=(8, 0))
         gi_var = tk.StringVar(value=self.settings.get("guard_ignore") or "")
         gifrm = ttk.Frame(frm)
@@ -3232,12 +3239,14 @@ class DebuggerApp(tk.Tk):
             "Loads on background threads cannot pause instantly; they are reported and the script pauses at its "
             "next statement. Changing the assembly-load option takes effect on the next run.\n\n"
             "Process guard: 'first instruction' is the moment a hollowed process has its injected image in place "
-            "and is about to run it; 'creation' is before the creator has touched it; '.NET/CLR load' is the "
-            "moment clr.dll or coreclr.dll is mapped into the process, which happens for ANY technique that ends "
-            "up running .NET code there (even one that redirects the thread's entry point to skip the native "
-            "'first instruction' trap entirely, since it still has to load the CLR to run managed code) — "
-            "catch it there and dnSpy's Attach to Process works, because the runtime exists but hasn't started "
-            "running the payload yet. While the guard is on, no other debugger can attach to the script process "
+            "and is about to run it; 'creation' is before the creator has touched it; '.NET/CLR load' catches the "
+            "CLR's own first-chance 'notification' exception (0x04242420), which it raises once its debugging data "
+            "structures are valid so a native debugger knows it is safe to hand over to a managed one — this "
+            "fires after clr.dll/coreclr.dll loads but before any managed code, including the payload's own "
+            "assemblies, runs, which is also why it still works against a loader that redirects the thread's entry "
+            "point to skip the native 'first instruction' trap entirely: it still has to run enough of the CLR to "
+            "get this far. dnSpy's Attach to Process only lists a process once it reaches this point. While the "
+            "guard is on, no other debugger can attach to the script process "
             "itself (Windows allows one debugger per process); handing off a child detaches the guard from that "
             "child only. The script process sees IsDebuggerPresent() = true. Takes effect on the next run. The "
             "thread stays suspended the whole time it is frozen, including after hand-off, so whichever debugger "

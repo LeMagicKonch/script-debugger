@@ -136,13 +136,20 @@ were already there before the script started (PATH, `$PSVersionTable`, ...).
        command — WinDbg or x64dbg — against its PID, then *Resume* once your
        breakpoints are set), *Resume*, or *Kill*.
      - *At .NET/CLR load* catches a **managed (.NET) payload** instead, and is the one to use
-       for "most PowerShell malware ends up executing .NET payloads": a process only needs to
-       load the CLR to run managed code at all, so this fires even when a hollowing loader
-       redirects the thread's entry point to skip the native "first instruction" trap
-       entirely. The pop-up's hand-off here launches the **managed** debugger configured for
-       assembly-load pause / attach-at-start (dnSpy etc.), since the runtime exists but hasn't
-       run the payload's `Main` yet — this is the combination that makes dnSpy useful
-       against an externally hollowed process, not just against PowerShell's own `Assembly.Load`.
+       for "most PowerShell malware ends up executing .NET payloads". It freezes on the CLR's
+       own first-chance "notification" exception (`0x04242420`), which the runtime raises once
+       its debugging data structures are valid, specifically so a native debugger knows it is
+       safe to hand over to a managed one — the same signal WinDbg's SOS and Visual Studio's
+       mixed-mode debugger wait for. That is later than `clr.dll`/`coreclr.dll` simply being
+       mapped (dnSpy's own Attach to Process list won't show a process that young) but still
+       well before any managed code, including the payload's own assemblies, runs — confirmed
+       by tracing every debug event against a real `MSBuild.exe` launched suspended. It still
+       fires even when a hollowing loader redirects the thread's entry point to skip the native
+       "first instruction" trap entirely, since reaching this point only requires running
+       enough of the CLR, not the native loader thunk. The pop-up's hand-off here launches the
+       **managed** debugger configured for assembly-load pause / attach-at-start (dnSpy etc.) —
+       this is the combination that makes dnSpy useful against an externally hollowed process,
+       not just against PowerShell's own `Assembly.Load`.
      Images listed under *Never freeze* (default `conhost.exe`) are only logged. While the
      guard is on, no other debugger can attach to the script process itself, so it is an
      alternative to *Attach before the first line*, not an addition to it. The script process
