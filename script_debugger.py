@@ -119,6 +119,7 @@ BATCH_HEAD = (
     b"@exit /b %__dbg_el%\r\n"
     b":__dbg_main\r\n"
     b'@set >"%__DBG_DIR%\\vars_0.txt"\r\n'
+    b'@if "%__DBG_WAIT_START%"=="1" (echo __DBG_MSG__ ready& set /p "__dbg_cmd=")\r\n'
 )
 BATCH_INITIAL_PAD = 4096   # slack so that edits before the paused line can grow
 BATCH_MAX_LINE = 8000
@@ -260,6 +261,11 @@ $global:__DbgGen = 0
 $global:__DbgReloadAfter = -1
 $global:__DbgReloadGen = 0
 $global:__DbgInjecting = $false
+$global:__DbgInUser = $false
+$global:__DbgInAction = $false
+$global:__DbgAsmType = $null
+$global:__DbgAsmOn = $false
+$global:__DbgMainThread = [System.Threading.Thread]::CurrentThread.ManagedThreadId
 $global:__DbgVars = $null
 $global:__DbgFuncs = $null
 $global:__DbgTopDepth = -1
@@ -287,7 +293,8 @@ function global:__DbgRefreshControl {
         $__cps = New-Object 'System.Collections.Generic.HashSet[int]'
         if ($__j.cps) { foreach ($__b in @($__j.cps)) { $null = $__cps.Add([int]$__b) } }
         $global:__DbgCtl = @{ bps = $__bps; cps = $__cps; mode = [string]$__j.mode; depth = [int]$__j.depth;
-                             temp = [int]$__j.temp; track = [string]$__j.track }
+                             temp = [int]$__j.temp; track = [string]$__j.track; asm = [bool]$__j.asm }
+        if ($global:__DbgAsmOn) { $global:__DbgAsmType::Enabled = [bool]$__j.asm }
         $global:__DbgCtlTime = $__m
         return $true
     } catch { return $false }
@@ -508,6 +515,152 @@ function global:__DbgStatements($ast) {
     return $__s
 }
 
+function global:__DbgWaitLoop($scopeOffset, $frameVars) {
+    # Paused: serve GUI commands until 'go'. Variable lookups use scope numbers relative
+    # to the caller ($scopeOffset) or, for assembly-load pauses, captured frame variables.
+    while ($true) {
+        $__cmd = [Console]::In.ReadLine()
+        if ($null -eq $__cmd -or $__cmd -eq 'go') { break }
+        if ($__cmd.StartsWith('dump|')) {
+            $__parts = $__cmd.Split('|', 4)
+            try {
+                if ($__parts[1] -eq 'Global') { $__dv = Get-Variable -Scope Global -Name $__parts[2] -ErrorAction Stop }
+                elseif ($frameVars) { $__dv = $frameVars[[int]$__parts[1] - 1][$__parts[2]]; if ($null -eq $__dv) { throw "Variable '$($__parts[2])' not found" } }
+                else { $__dv = Get-Variable -Scope ([int]$__parts[1] + $scopeOffset) -Name $__parts[2] -ErrorAction Stop }
+                __DbgWriteValue $__dv.Value $__parts[3]
+                __DbgMsg "dump-ok|$($__parts[3])"
+            } catch { __DbgMsg "dump-error|$($_.Exception.Message)" }
+        } elseif ($__cmd.StartsWith('reload|')) {
+            $__parts = $__cmd.Split('|')
+            if ($global:__DbgStmtEnd -le 0) {
+                __DbgMsg "reload-error|Live editing is not available for this script (it uses begin/process/end blocks or using statements)."
+            } else {
+                $__t = $null; $__e = $null
+                try {
+                    $__src = [IO.File]::ReadAllText($global:__DbgSourceFile)
+                    $null = [System.Management.Automation.Language.Parser]::ParseInput($__src, [ref]$__t, [ref]$__e)
+                } catch { $__e = @($_.Exception.Message) }
+                if ($__e -and $__e.Count -gt 0) {
+                    $__m = $__e[0]
+                    if ($__m.Extent) { __DbgMsg "reload-error|Line $($__m.Extent.StartLineNumber): $($__m.Message)" }
+                    else { __DbgMsg "reload-error|$__m" }
+                } else {
+                    $global:__DbgReloadAfter = [int]$__parts[1]
+                    $global:__DbgReloadGen = [int]$__parts[2]
+                    __DbgMsg "reload-ok|$($__parts[2])"
+                }
+            }
+        }
+    }
+    $global:__DbgCtlTime = [DateTime]::MinValue
+    $null = __DbgRefreshControl
+    __DbgSyncBreakpoints
+}
+
+function global:__DbgVarEntry($name, $val, $label, $index) {
+    $__auto = [bool]$global:__DbgAuto.ContainsKey($name)
+    $__type = if ($null -eq $val) { 'null' } else { $val.GetType().Name }
+    if ($val -is [System.Collections.IEnumerator]) { $__str = '<enumerator>' }
+    elseif ($__auto) { $__str = try { __DbgShort $val 200 } catch { '?' } }
+    else { $__str = __DbgFormat $val }
+    return @{ n = $name; v = $__str; t = $__type; s = $label; a = $__auto; i = $index }
+}
+
+function global:__DbgAsmStop($a) {
+    # Called on the script's own thread the instant an assembly has been loaded, before
+    # any of its code runs. Pauses like a breakpoint, with the script's variables.
+    if (-not $global:__DbgInUser -or $global:__DbgInAction -or $global:__DbgInjecting) { return }
+    $global:__DbgInAction = $true
+    try {
+        $__loc = ''
+        try { if (-not $a.IsDynamic) { $__loc = [string]$a.Location } } catch { }
+        $__stack = @(Get-PSCallStack)
+        $__frames = New-Object System.Collections.Generic.List[object]
+        $__firstIdx = -1
+        for ($__i = 0; $__i -lt $__stack.Count; $__i++) {
+            if ($__stack[$__i].ScriptName -eq $global:__DbgShadow) { $__frames.Add($__stack[$__i]); if ($__firstIdx -lt 0) { $__firstIdx = $__i } }
+        }
+        $__line = 0; $__depth = 0
+        if ($__firstIdx -ge 0) { $__line = $__frames[0].ScriptLineNumber; $__depth = $__stack.Count - $__firstIdx + 1 }
+        $__list = New-Object System.Collections.Generic.List[object]
+        $__dicts = New-Object System.Collections.Generic.List[object]
+        $__n = $__frames.Count
+        for ($__k = 0; $__k -lt $__n; $__k++) {
+            if ($__k -eq $__n - 1) { $__label = 'Script' } elseif ($__k -eq 0) { $__label = 'Local' } else { $__label = "Caller $__k" }
+            if ($__k -lt $__n - 1 -and $__frames[$__k].Command) { $__label = "$__label ($($__frames[$__k].Command))" }
+            $__d = $__frames[$__k].GetFrameVariables()
+            $__dicts.Add($__d)
+            foreach ($__kv in $__d.GetEnumerator()) {
+                if ($__kv.Key -like '__Dbg*') { continue }
+                $__list.Add((__DbgVarEntry $__kv.Key $__kv.Value.Value $__label ($__k + 1)))
+            }
+        }
+        foreach ($__v in (Get-Variable -Scope Global)) {
+            if ($__v.Name -like '__Dbg*' -or $__v.Name -eq 'args' -or $global:__DbgAuto.ContainsKey($__v.Name)) { continue }
+            $__list.Add((__DbgVarEntry $__v.Name $__v.Value 'Global' 'Global'))
+        }
+        $global:__DbgSeq++
+        $__json = ConvertTo-Json -InputObject $__list.ToArray() -Compress -Depth 3
+        [IO.File]::WriteAllText((Join-Path $global:__DbgStateDir "vars_$($global:__DbgSeq).json"), $__json, [Text.Encoding]::UTF8)
+        __DbgMsg "asmload|$($a.FullName)|$__loc|$PID"
+        [Console]::Out.WriteLine("__DBG_STOP__ $__line $__depth $($global:__DbgStmtEnd) $($global:__DbgGen) $($global:__DbgSeq)")
+        [Console]::Out.Flush()
+        __DbgWaitLoop 0 $__dicts
+    } finally { $global:__DbgInAction = $false }
+}
+
+$global:__DbgAsmSource = @'
+using System;
+using System.Reflection;
+using System.Threading;
+public static class DbgAsmHook {
+    public static int MainThreadId;
+    public static volatile bool Enabled;
+    public static volatile bool PauseRequested;
+    public static string[] IgnorePrefixes = new string[0];
+    public static Action<Assembly> MainThreadCallback;
+    private static bool _hooked;
+    public static void Install(int mainThread, Action<Assembly> cb, string[] ignore) {
+        MainThreadId = mainThread; MainThreadCallback = cb; IgnorePrefixes = ignore ?? new string[0];
+        if (!_hooked) { AppDomain.CurrentDomain.AssemblyLoad += OnLoad; _hooked = true; }
+    }
+    private static void OnLoad(object sender, AssemblyLoadEventArgs e) {
+        if (!Enabled) return;
+        Assembly a = e.LoadedAssembly;
+        try { if (a.GlobalAssemblyCache) return; } catch { }
+        string loc = "";
+        try { if (!a.IsDynamic) loc = a.Location ?? ""; } catch { }
+        foreach (string p in IgnorePrefixes) { if (p.Length > 0 && loc.StartsWith(p, StringComparison.OrdinalIgnoreCase)) return; }
+        if (Thread.CurrentThread.ManagedThreadId == MainThreadId) {
+            Action<Assembly> cb = MainThreadCallback;
+            if (cb != null) { try { cb(a); } catch { } }
+        } else {
+            // PowerShell code cannot run on this thread; report, and make the script
+            // pause at its next statement.
+            try {
+                Console.Out.WriteLine("__DBG_MSG__ asmload-bg|" + a.FullName + "|" + loc + "|" + Thread.CurrentThread.ManagedThreadId);
+                Console.Out.Flush();
+            } catch { }
+            PauseRequested = true;
+        }
+    }
+}
+'@
+
+function global:__DbgInstallAsmHook {
+    try {
+        Add-Type -TypeDefinition $global:__DbgAsmSource -Language CSharp -ErrorAction Stop
+        $global:__DbgAsmType = [DbgAsmHook]
+        $__cb = [Action[System.Reflection.Assembly]]{ param($a) __DbgAsmStop $a }
+        [DbgAsmHook]::Install($global:__DbgMainThread, $__cb, @([string]$PSHOME, [string]$env:SystemRoot))
+        [DbgAsmHook]::Enabled = [bool]$global:__DbgCtl.asm
+        $global:__DbgAsmOn = $true
+        __DbgMsg 'info|Assembly-load pause is active.'
+    } catch {
+        __DbgMsg "info|Assembly-load pause could not be installed: $($_.Exception.Message)"
+    }
+}
+
 $global:__DbgAction = {
     $__ln = $_.Line
     if ($global:__DbgSw.ElapsedMilliseconds -ge 100) { if (__DbgRefreshControl) { __DbgSyncBreakpoints } }
@@ -516,20 +669,24 @@ $global:__DbgAction = {
     $__isBp = $__ctl.bps.Contains($__ln) -or ($__ctl.temp -eq $__ln)
     $__trackAll = ($__ctl.track -eq 'all')
     $__isCp = $__ctl.cps.Contains($__ln)
+    $__asmPause = $global:__DbgAsmOn -and $global:__DbgAsmType::PauseRequested
     # Fast path: nothing to do on this line.
-    if (-not $__isBp -and $__mode -eq 'run' -and -not $__trackAll -and -not $__isCp) { return }
-    if ($global:__DbgInjecting) { return }
+    if (-not $__isBp -and $__mode -eq 'run' -and -not $__trackAll -and -not $__isCp -and -not $__asmPause) { return }
+    if ($global:__DbgInjecting -or $global:__DbgInAction) { return }
+    $global:__DbgInAction = $true
+    try {
     $__stack = @(Get-PSCallStack)
     # A breakpoint on a line without a statement fires against the first statement that
     # does run; only the hit whose line matches the frame's current line is real.
     if ($__stack.Count -lt 2 -or $__stack[1].ScriptLineNumber -ne $__ln) { return }
     try { if ($__stack[1].Position.Text -like '__DbgCheck*') { return } } catch { }
     $__depth = $__stack.Count
-    $__stop = $__isBp -or $__mode -eq 'step' -or
+    $__stop = $__isBp -or $__asmPause -or $__mode -eq 'step' -or
               ($__mode -eq 'step_over' -and $__depth -le $__ctl.depth) -or
               ($__mode -eq 'step_out' -and $__depth -lt $__ctl.depth)
     if (-not $__stop -and -not $__trackAll -and -not $__isCp) { return }
     if ($__ctl.temp -eq $__ln) { $__ctl.temp = -1 }
+    if ($__asmPause) { $global:__DbgAsmType::PauseRequested = $false }
     $__list = New-Object System.Collections.Generic.List[object]
     $__scopes = New-Object System.Collections.Generic.List[object]
     $__i = 1
@@ -579,45 +736,19 @@ $global:__DbgAction = {
     }
     [Console]::Out.WriteLine("__DBG_STOP__ $__ln $__depth $($global:__DbgStmtEnd) $($global:__DbgGen) $($global:__DbgSeq)")
     [Console]::Out.Flush()
-    while ($true) {
-        $__cmd = [Console]::In.ReadLine()
-        if ($null -eq $__cmd -or $__cmd -eq 'go') { break }
-        if ($__cmd.StartsWith('dump|')) {
-            $__parts = $__cmd.Split('|', 4)
-            try {
-                if ($__parts[1] -eq 'Global') { $__dv = Get-Variable -Scope Global -Name $__parts[2] -ErrorAction Stop }
-                else { $__dv = Get-Variable -Scope ([int]$__parts[1]) -Name $__parts[2] -ErrorAction Stop }
-                __DbgWriteValue $__dv.Value $__parts[3]
-                __DbgMsg "dump-ok|$($__parts[3])"
-            } catch { __DbgMsg "dump-error|$($_.Exception.Message)" }
-        } elseif ($__cmd.StartsWith('reload|')) {
-            $__parts = $__cmd.Split('|')
-            if ($global:__DbgStmtEnd -le 0) {
-                __DbgMsg "reload-error|Live editing is not available for this script (it uses begin/process/end blocks or using statements)."
-            } else {
-                $__t = $null; $__e = $null
-                try {
-                    $__src = [IO.File]::ReadAllText($global:__DbgSourceFile)
-                    $null = [System.Management.Automation.Language.Parser]::ParseInput($__src, [ref]$__t, [ref]$__e)
-                } catch { $__e = @($_.Exception.Message) }
-                if ($__e -and $__e.Count -gt 0) {
-                    $__m = $__e[0]
-                    if ($__m.Extent) { __DbgMsg "reload-error|Line $($__m.Extent.StartLineNumber): $($__m.Message)" }
-                    else { __DbgMsg "reload-error|$__m" }
-                } else {
-                    $global:__DbgReloadAfter = [int]$__parts[1]
-                    $global:__DbgReloadGen = [int]$__parts[2]
-                    __DbgMsg "reload-ok|$($__parts[2])"
-                }
-            }
-        }
-    }
-    $global:__DbgCtlTime = [DateTime]::MinValue
-    $null = __DbgRefreshControl
-    __DbgSyncBreakpoints
+    __DbgWaitLoop 1 $null
+    } finally { $global:__DbgInAction = $false }
 }
 
 $null = __DbgRefreshControl
+if ($env:__DBG_ASM -eq '1') { __DbgInstallAsmHook }
+if ($env:__DBG_WAIT_START -eq '1') {
+    # Let the GUI attach a native debugger before any script code runs.
+    __DbgMsg "ready|$PID"
+    $null = [Console]::In.ReadLine()
+    $global:__DbgCtlTime = [DateTime]::MinValue
+    $null = __DbgRefreshControl
+}
 $__DbgText = [IO.File]::ReadAllText($global:__DbgSourceFile)
 $__DbgTokens = $null; $__DbgErrors = $null
 $__DbgAst = [System.Management.Automation.Language.Parser]::ParseInput($__DbgText, [ref]$__DbgTokens, [ref]$__DbgErrors)
@@ -633,8 +764,9 @@ if ($__DbgWhole) {
     [IO.File]::WriteAllText($global:__DbgShadow, $__DbgText, [Text.Encoding]::UTF8)
     __DbgSetBreakpoints ((($__DbgText -split "`n").Count) + 1)
     try {
-        $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; & $global:__DbgShadow ' + $__DbgArgString)
+        $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgInUser = $true; & $global:__DbgShadow ' + $__DbgArgString)
         & $__DbgInvoke
+        $global:__DbgInUser = $false
         if ($null -ne $LASTEXITCODE) { $__DbgExit = $LASTEXITCODE }
     } catch {
         [Console]::Error.WriteLine("Unhandled error: " + $_.Exception.Message)
@@ -658,9 +790,9 @@ if ($__DbgWhole) {
             [IO.File]::WriteAllText($global:__DbgShadow, $__DbgChunk, [Text.Encoding]::UTF8)
             __DbgSetBreakpoints ((($__DbgChunk -split "`n").Count) + 1)
             if ($__DbgInject) {
-                $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgTopDepth = @(Get-PSCallStack).Count + 2; & $global:__DbgShadow')
+                $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgInUser = $true; $global:__DbgTopDepth = @(Get-PSCallStack).Count + 2; & $global:__DbgShadow')
             } else {
-                $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgTopDepth = @(Get-PSCallStack).Count + 2; & $global:__DbgShadow ' + $__DbgArgString)
+                $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgInUser = $true; $global:__DbgTopDepth = @(Get-PSCallStack).Count + 2; & $global:__DbgShadow ' + $__DbgArgString)
             }
             $global:__DbgInjecting = [bool]$__DbgInject
             $__DbgReload = $false
@@ -669,7 +801,7 @@ if ($__DbgWhole) {
             } catch {
                 if ($_.FullyQualifiedErrorId -eq '__DbgReload' -or $_.Exception.Message -eq '__DbgReload') { $__DbgReload = $true }
                 else { throw }
-            }
+            } finally { $global:__DbgInUser = $false }
             if (-not $__DbgReload) { break }
             # --- restart from the edited text ------------------------------------------
             $__DbgNewText = [IO.File]::ReadAllText($global:__DbgSourceFile)
@@ -765,6 +897,8 @@ class DebugSession:
         self.mode = "run"
         self.mode_depth = 0                 # absolute depth as reported by the script
         self.track = TRACK_POINTS
+        self.asm_pause = False              # PowerShell: pause when the script loads an assembly
+        self.wait_start = False             # emit 'ready' and wait before running any script code
         self.state_dir = tempfile.mkdtemp(prefix="scriptdbg_")
         self.encoding = "utf-8"
         self._stdin_lock = threading.Lock()
@@ -828,7 +962,7 @@ class DebugSession:
             return
         with self.lock:
             ctl = {"mode": self.mode, "depth": self.mode_depth, "temp": self.temp_breakpoint or -1,
-                   "track": self.track}
+                   "track": self.track, "asm": bool(self.asm_pause)}
         ctl["bps"] = self._control_lines("bps")
         ctl["cps"] = self._control_lines("cps")
         try:
@@ -1053,6 +1187,7 @@ class BatchSession(DebugSession):
             fh.write(data)
         env = dict(os.environ)
         env["__DBG_DIR"] = self.state_dir
+        env["__DBG_WAIT_START"] = "1" if self.wait_start else "0"
         inner = f'"{self.shadow_path}"'
         if self.args.strip():
             inner += " " + self.args.strip()
@@ -1155,6 +1290,8 @@ class PowerShellSession(DebugSession):
         cmd = [self.ps_exe, "-NoProfile", "-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", command]
         env = dict(os.environ)
         env["__DBG_ARGS"] = self.args.strip()
+        env["__DBG_WAIT_START"] = "1" if self.wait_start else "0"
+        env["__DBG_ASM"] = "1" if self.asm_pause else "0"
         return cmd, env, os.path.dirname(self.script_path)
 
     def _read_vars(self, seq):
@@ -1236,6 +1373,43 @@ def _bp_store_path():
     folder = os.path.join(base, "ScriptDebugger")
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, "breakpoints.json")
+
+
+DEBUGGER_PRESETS = [
+    ("WinDbg (windbgx)", 'windbgx.exe -p {pid} -c ".childdbg 1; sxe cpr; g"'),
+    ("WinDbg classic", 'windbg.exe -p {pid} -c ".childdbg 1; sxe cpr; g"'),
+    ("x64dbg", "x64dbg.exe -p {pid}"),
+    ("dnSpy (then Debug > Attach to Process)", "dnSpy.exe"),
+    ("Custom", ""),
+]
+DEFAULT_SETTINGS = {"native_template": DEBUGGER_PRESETS[0][1], "attach_at_start": False, "asm_pause": False}
+
+
+def _settings_path():
+    base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(base, "ScriptDebugger")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "settings.json")
+
+
+def load_settings():
+    data = dict(DEFAULT_SETTINGS)
+    try:
+        with open(_settings_path(), "r", encoding="utf-8") as fh:
+            saved = json.load(fh)
+        if isinstance(saved, dict):
+            data.update({k: saved[k] for k in DEFAULT_SETTINGS if k in saved})
+    except Exception:  # noqa: BLE001
+        pass
+    return data
+
+
+def save_settings(data):
+    try:
+        with open(_settings_path(), "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=1)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def load_saved_points(path):
@@ -1785,6 +1959,8 @@ class DebuggerApp(tk.Tk):
         self.last_line = None
         self.state = "idle"
         self.edits_pending = False
+        self.settings = load_settings()
+        self.pending_asm_note = None
 
         self._build_menu()
         self._build_toolbar()
@@ -1822,6 +1998,9 @@ class DebuggerApp(tk.Tk):
         dbg.add_command(label="Toggle capture point at cursor", accelerator="Ctrl+F9",
                         command=lambda: self.toggle_capture_point(self.code.cursor_line))
         dbg.add_command(label="Clear all breakpoints and capture points", command=self.clear_points)
+        dbg.add_separator()
+        dbg.add_command(label="Attach native debugger now", command=self.attach_native_debugger)
+        dbg.add_command(label="Native debugger settings...", command=self.native_debugger_settings)
         menubar.add_cascade(label="Debug", menu=dbg)
         helpm = tk.Menu(menubar, tearoff=0)
         helpm.add_command(label="How it works", command=self.show_help)
@@ -1852,6 +2031,8 @@ class DebuggerApp(tk.Tk):
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=4)
         self.btn_apply = ttk.Button(bar, text="Apply edits", command=self.apply_edits)
         self.btn_apply.pack(side="left", padx=2)
+        self.btn_attach = ttk.Button(bar, text="Attach debugger", command=self.attach_native_debugger)
+        self.btn_attach.pack(side="left", padx=2)
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=4)
         ttk.Label(bar, text="Track vars:").pack(side="left")
         self.track_var = tk.StringVar(value=TRACK_CHOICES[0][0])
@@ -1953,6 +2134,7 @@ class DebuggerApp(tk.Tk):
         en(self.btn_stop, running or paused)
         en(self.btn_save, bool(self.script_path))
         en(self.btn_apply, paused and self.edits_pending)
+        en(self.btn_attach, running or paused)
         self.code.set_editable(loaded or paused)
         if self.kind == "powershell":
             self.ps_label.pack(side="left")
@@ -2312,6 +2494,9 @@ class DebuggerApp(tk.Tk):
             self.session.mode = mode
             self.session.track = self._track_mode()
             self.session.temp_breakpoint = temp_bp
+            self.session.asm_pause = bool(self.settings.get("asm_pause")) and self.kind == "powershell"
+            self.session.wait_start = bool(self.settings.get("attach_at_start"))
+        self.pending_asm_note = None
         self.vars_table.clear()
         self.history.clear()
         self.clear_output()
@@ -2406,6 +2591,23 @@ class DebuggerApp(tk.Tk):
                 self._append_output(f"[debugger] edited script is now in effect (next statement at line {nxt})\n", "dbg")
             elif mkind == "info":
                 self._append_output(f"[debugger] {payload}\n", "dbg")
+            elif mkind == "ready":
+                self._on_ready()
+            elif mkind in ("asmload", "asmload-bg"):
+                parts = payload.split("|")
+                name = parts[0] if parts else "?"
+                loc = parts[1] if len(parts) > 1 and parts[1] else "loaded from memory, no file on disk"
+                pid = self.session.proc.pid if self.session and self.session.proc else "?"
+                if mkind == "asmload":
+                    self.pending_asm_note = (f"Assembly loaded: {name} ({loc}). None of its code has run yet. "
+                                             f"PID {pid}: use Attach debugger to hand off.")
+                    self._append_output(f"[debugger] assembly loaded on the script thread: {name} ({loc})\n", "dbg")
+                else:
+                    thread = parts[3] if len(parts) > 3 else "?"
+                    self.pending_asm_note = (f"Assembly {name} was loaded by background thread {thread} ({loc}); "
+                                             f"its code may already be running. PID {pid}.")
+                    self._append_output(f"[debugger] assembly loaded on background thread {thread}: {name} ({loc}); "
+                                        f"pausing at the next statement\n", "dbg")
         elif kind == "stop":
             _, line, depth, variables, paused, stmt_end = ev
             self._apply_variables(line, variables, paused)
@@ -2415,8 +2617,12 @@ class DebuggerApp(tk.Tk):
                 where = f"line {line}"
                 if self.session and self.session.supports_depth and depth > 0:
                     where += f" (call depth {depth})"
-                self._status(f"Paused before {where}. F5 continue, F11 step into, F10 step over. "
-                             f"You can edit the script now.")
+                if self.pending_asm_note:
+                    self._status(f"Paused before {where}. {self.pending_asm_note}")
+                    self.pending_asm_note = None
+                else:
+                    self._status(f"Paused before {where}. F5 continue, F11 step into, F10 step over. "
+                                 f"You can edit the script now.")
         elif kind == "end":
             _, code, killed = ev
             self.code.set_current(None)
@@ -2478,6 +2684,105 @@ class DebuggerApp(tk.Tk):
         self.output.configure(state="normal")
         self.output.delete("1.0", "end")
         self.output.configure(state="disabled")
+
+    # --- native debugger hand-off ---------------------------------------------------
+    def _on_ready(self):
+        """The script process is up and waiting before its first line."""
+        if not self.session:
+            return
+        pid = self.session.proc.pid
+        self.session.paused = True
+        self.session.current_line = None
+        self.code.set_current(None)
+        self._set_state("paused")
+        if self.settings.get("attach_at_start"):
+            ok = self.attach_native_debugger()
+            if ok:
+                self._status(f"Waiting before the first line. Native debugger launched for PID {pid}: set its "
+                             f"breakpoints, then Continue (F5) or Step Into (F11).")
+                return
+        self._status(f"Waiting before the first line (PID {pid}). Attach a debugger, then Continue (F5) or "
+                     f"Step Into (F11).")
+
+    def attach_native_debugger(self):
+        """Launch the configured native debugger against the script's process. Returns True on launch."""
+        if not (self.session and self.session.proc and self.session.proc.poll() is None):
+            self._status("No running script process to attach to.")
+            return False
+        pid = self.session.proc.pid
+        template = (self.settings.get("native_template") or "").strip()
+        if not template:
+            messagebox.showinfo(APP_TITLE, f"No debugger command is configured (Debug > Native debugger settings).\n\n"
+                                           f"The script's process ID is {pid}.")
+            return False
+        cmd = template.replace("{pid}", str(pid))
+        try:
+            subprocess.Popen(cmd)
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"Could not start the debugger:\n{cmd}\n\n{exc}\n\n"
+                                            f"Edit the command in Debug > Native debugger settings (use the full "
+                                            f"path to the executable). The script's process ID is {pid}.")
+            return False
+        self._append_output(f"[debugger] launched: {cmd}\n", "dbg")
+        self._status(f"Debugger launched for PID {pid}. The script stays {self.state} until you continue it here.")
+        return True
+
+    def native_debugger_settings(self):
+        win = tk.Toplevel(self)
+        win.title("Native debugger settings")
+        win.transient(self)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        attach_var = tk.BooleanVar(value=bool(self.settings.get("attach_at_start")))
+        asm_var = tk.BooleanVar(value=bool(self.settings.get("asm_pause")))
+        tmpl_var = tk.StringVar(value=self.settings.get("native_template") or "")
+        preset_var = tk.StringVar(value="Custom")
+        for label, tmpl in DEBUGGER_PRESETS:
+            if tmpl and tmpl == tmpl_var.get():
+                preset_var.set(label)
+        ttk.Label(frm, text="Debugger command ({pid} is replaced by the script's process ID):").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(frm, text="Preset:").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        preset = ttk.Combobox(frm, textvariable=preset_var, state="readonly", width=44,
+                              values=[p[0] for p in DEBUGGER_PRESETS])
+        preset.grid(row=1, column=1, sticky="w", pady=(6, 0))
+
+        def on_preset(event=None):
+            for label, tmpl in DEBUGGER_PRESETS:
+                if label == preset_var.get() and tmpl:
+                    tmpl_var.set(tmpl)
+        preset.bind("<<ComboboxSelected>>", on_preset)
+        ttk.Label(frm, text="Command:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(frm, textvariable=tmpl_var, width=70).grid(row=2, column=1, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(frm, text="Attach the debugger before the script's first line runs (Run waits for you "
+                                  "to Continue)", variable=attach_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        ttk.Checkbutton(frm, text="PowerShell: pause the script the moment it loads an assembly (in-memory loads "
+                                  "included), before any of its code runs", variable=asm_var).grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(frm, foreground="#7a8290", justify="left", wraplength=620, text=(
+            "WinDbg: .childdbg 1 debugs every child process the script creates (including ones created suspended "
+            "for hollowing); sxe cpr breaks on each process creation. Add sxe ld:<name> or bp ntdll!NtMapViewOfSection "
+            "etc. as needed. Assemblies loaded from memory never produce a native module-load event, which is what "
+            "the assembly-load pause is for. Assemblies from $PSHOME, the Windows folder and the GAC are ignored. "
+            "Loads on background threads cannot pause instantly; they are reported and the script pauses at its "
+            "next statement. Changing the assembly-load option takes effect on the next run.")).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        btns = ttk.Frame(frm)
+        btns.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+
+        def save():
+            self.settings["native_template"] = tmpl_var.get().strip()
+            self.settings["attach_at_start"] = bool(attach_var.get())
+            self.settings["asm_pause"] = bool(asm_var.get())
+            save_settings(self.settings)
+            if self.session:
+                self.session.asm_pause = self.settings["asm_pause"] and self.kind == "powershell"
+                self.session.write_control()
+            win.destroy()
+        ttk.Button(btns, text="Save", command=save).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=(0, 6))
+        win.grab_set()
 
     # --- misc ----------------------------------------------------------------------
     def show_help(self):
