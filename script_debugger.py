@@ -3130,9 +3130,9 @@ class DebuggerApp(tk.Tk):
         gc_var = tk.BooleanVar(value=bool(self.settings.get("guard_created")))
         gf_var = tk.BooleanVar(value=bool(self.settings.get("guard_first", True)))
         gd_var = tk.BooleanVar(value=bool(self.settings.get("guard_dlls")))
-        ttk.Checkbutton(frm, text="Process guard: run the script as this debugger's debuggee so every new process in "
-                                  "its tree (children, grandchildren, suspended/hollowed ones) is frozen and offered "
-                                  "for hand-off before it executes", variable=guard_var).grid(
+        ttk.Checkbutton(frm, text="Process guard: freeze every new process in the script's tree (children, "
+                                  "grandchildren, suspended ones) before it executes and offer it for hand-off",
+                        variable=guard_var).grid(
             row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
         gfrm = ttk.Frame(frm)
         gfrm.grid(row=6, column=0, columnspan=2, sticky="w", padx=(24, 0))
