@@ -70,21 +70,6 @@ python script_debugger.py samples\demo.cmd
 7. Script output appears in the dark console pane. Scripts that read from standard input
    (`pause`, `set /p`, `Read-Host`) receive what you type into *Send to script stdin*.
 8. **Arguments** are passed to the script exactly as typed, e.g. `-Name Bob` or `C:\logs 5`.
-9. **Handing off to a native debugger** (Debug > Native debugger settings). Two tools for
-   scripts that load DLLs or spawn processes:
-   - *Attach before the first line*: Run starts the script process, launches your debugger
-     command against its PID (presets for WinDbg, x64dbg, dnSpy, or a custom command with
-     `{pid}`), and waits until you press Continue. With WinDbg the preset enables
-     `.childdbg 1` and `sxe cpr`, so every child process the script creates, including one
-     created suspended for hollowing, is debugged and breaks on creation. *Attach debugger*
-     on the toolbar launches the same command at any later pause.
-   - *Pause on assembly load* (PowerShell): the script pauses the instant it loads a .NET
-     assembly, before any of that assembly's code runs, including assemblies loaded from a
-     byte array that never touch disk (which a native debugger's module-load events cannot
-     see). The status bar names the assembly and the PID; attach dnSpy or WinDbg with SOS
-     there. Assemblies from `$PSHOME`, the Windows folder and the GAC are ignored. A load
-     performed by a background thread cannot pause instantly: it is reported and the script
-     pauses at its next statement. `samplessmload.ps1` demonstrates both.
 
 ## How it works
 
@@ -124,26 +109,6 @@ editing.
 
 Toggle *Show inherited environment* / *Show automatic variables* to also see the variables that
 were already there before the script started (PATH, `$PSVersionTable`, ...).
-
-   - *Process guard*: the debugger launches the script's process as its own debuggee
-     (Windows `DEBUG_PROCESS`), which automatically covers every descendant: children,
-     grandchildren, and processes created suspended and resumed later. Each new process is
-     frozen at its first instruction (optionally also at creation) and a pop-up offers
-     *Hand off to debugger* (detach from that process, keep it frozen, launch your debugger
-     command against its PID, then *Resume* when your breakpoints are set), *Resume* or
-     *Kill*. Images listed under *Never freeze* (default `conhost.exe`) are only logged.
-     While the guard is on, no other debugger can attach to the script process itself, so
-     it is an alternative to *Attach before the first line*, not an addition to it. The
-     script process sees `IsDebuggerPresent()` as true. `samples\spawn.ps1` demonstrates a
-     child created suspended, resumed, and spawning a grandchild.
-
-## Analysing hostile scripts
-
-The debugger runs the script for real, in a normal cmd.exe or powershell.exe, with your
-account's rights. Use an isolated analysis VM with no network, and remember that real-time
-antivirus will quarantine a malicious DLL long before the debugger sees it. Anti-debugging
-checks inside a loaded DLL (`IsDebuggerPresent`, timing) see the native debugger you attach,
-not this tool.
 
 ## Known limitations
 

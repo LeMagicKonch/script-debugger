@@ -119,7 +119,6 @@ BATCH_HEAD = (
     b"@exit /b %__dbg_el%\r\n"
     b":__dbg_main\r\n"
     b'@set >"%__DBG_DIR%\\vars_0.txt"\r\n'
-    b'@if "%__DBG_WAIT_START%"=="1" (echo __DBG_MSG__ ready& set /p "__dbg_cmd=")\r\n'
 )
 BATCH_INITIAL_PAD = 4096   # slack so that edits before the paused line can grow
 BATCH_MAX_LINE = 8000
@@ -261,11 +260,6 @@ $global:__DbgGen = 0
 $global:__DbgReloadAfter = -1
 $global:__DbgReloadGen = 0
 $global:__DbgInjecting = $false
-$global:__DbgInUser = $false
-$global:__DbgInAction = $false
-$global:__DbgAsmType = $null
-$global:__DbgAsmOn = $false
-$global:__DbgMainThread = [System.Threading.Thread]::CurrentThread.ManagedThreadId
 $global:__DbgVars = $null
 $global:__DbgFuncs = $null
 $global:__DbgTopDepth = -1
@@ -293,8 +287,7 @@ function global:__DbgRefreshControl {
         $__cps = New-Object 'System.Collections.Generic.HashSet[int]'
         if ($__j.cps) { foreach ($__b in @($__j.cps)) { $null = $__cps.Add([int]$__b) } }
         $global:__DbgCtl = @{ bps = $__bps; cps = $__cps; mode = [string]$__j.mode; depth = [int]$__j.depth;
-                             temp = [int]$__j.temp; track = [string]$__j.track; asm = [bool]$__j.asm }
-        if ($global:__DbgAsmOn) { $global:__DbgAsmType::Enabled = [bool]$__j.asm }
+                             temp = [int]$__j.temp; track = [string]$__j.track }
         $global:__DbgCtlTime = $__m
         return $true
     } catch { return $false }
@@ -515,152 +508,6 @@ function global:__DbgStatements($ast) {
     return $__s
 }
 
-function global:__DbgWaitLoop($scopeOffset, $frameVars) {
-    # Paused: serve GUI commands until 'go'. Variable lookups use scope numbers relative
-    # to the caller ($scopeOffset) or, for assembly-load pauses, captured frame variables.
-    while ($true) {
-        $__cmd = [Console]::In.ReadLine()
-        if ($null -eq $__cmd -or $__cmd -eq 'go') { break }
-        if ($__cmd.StartsWith('dump|')) {
-            $__parts = $__cmd.Split('|', 4)
-            try {
-                if ($__parts[1] -eq 'Global') { $__dv = Get-Variable -Scope Global -Name $__parts[2] -ErrorAction Stop }
-                elseif ($frameVars) { $__dv = $frameVars[[int]$__parts[1] - 1][$__parts[2]]; if ($null -eq $__dv) { throw "Variable '$($__parts[2])' not found" } }
-                else { $__dv = Get-Variable -Scope ([int]$__parts[1] + $scopeOffset) -Name $__parts[2] -ErrorAction Stop }
-                __DbgWriteValue $__dv.Value $__parts[3]
-                __DbgMsg "dump-ok|$($__parts[3])"
-            } catch { __DbgMsg "dump-error|$($_.Exception.Message)" }
-        } elseif ($__cmd.StartsWith('reload|')) {
-            $__parts = $__cmd.Split('|')
-            if ($global:__DbgStmtEnd -le 0) {
-                __DbgMsg "reload-error|Live editing is not available for this script (it uses begin/process/end blocks or using statements)."
-            } else {
-                $__t = $null; $__e = $null
-                try {
-                    $__src = [IO.File]::ReadAllText($global:__DbgSourceFile)
-                    $null = [System.Management.Automation.Language.Parser]::ParseInput($__src, [ref]$__t, [ref]$__e)
-                } catch { $__e = @($_.Exception.Message) }
-                if ($__e -and $__e.Count -gt 0) {
-                    $__m = $__e[0]
-                    if ($__m.Extent) { __DbgMsg "reload-error|Line $($__m.Extent.StartLineNumber): $($__m.Message)" }
-                    else { __DbgMsg "reload-error|$__m" }
-                } else {
-                    $global:__DbgReloadAfter = [int]$__parts[1]
-                    $global:__DbgReloadGen = [int]$__parts[2]
-                    __DbgMsg "reload-ok|$($__parts[2])"
-                }
-            }
-        }
-    }
-    $global:__DbgCtlTime = [DateTime]::MinValue
-    $null = __DbgRefreshControl
-    __DbgSyncBreakpoints
-}
-
-function global:__DbgVarEntry($name, $val, $label, $index) {
-    $__auto = [bool]$global:__DbgAuto.ContainsKey($name)
-    $__type = if ($null -eq $val) { 'null' } else { $val.GetType().Name }
-    if ($val -is [System.Collections.IEnumerator]) { $__str = '<enumerator>' }
-    elseif ($__auto) { $__str = try { __DbgShort $val 200 } catch { '?' } }
-    else { $__str = __DbgFormat $val }
-    return @{ n = $name; v = $__str; t = $__type; s = $label; a = $__auto; i = $index }
-}
-
-function global:__DbgAsmStop($a) {
-    # Called on the script's own thread the instant an assembly has been loaded, before
-    # any of its code runs. Pauses like a breakpoint, with the script's variables.
-    if (-not $global:__DbgInUser -or $global:__DbgInAction -or $global:__DbgInjecting) { return }
-    $global:__DbgInAction = $true
-    try {
-        $__loc = ''
-        try { if (-not $a.IsDynamic) { $__loc = [string]$a.Location } } catch { }
-        $__stack = @(Get-PSCallStack)
-        $__frames = New-Object System.Collections.Generic.List[object]
-        $__firstIdx = -1
-        for ($__i = 0; $__i -lt $__stack.Count; $__i++) {
-            if ($__stack[$__i].ScriptName -eq $global:__DbgShadow) { $__frames.Add($__stack[$__i]); if ($__firstIdx -lt 0) { $__firstIdx = $__i } }
-        }
-        $__line = 0; $__depth = 0
-        if ($__firstIdx -ge 0) { $__line = $__frames[0].ScriptLineNumber; $__depth = $__stack.Count - $__firstIdx + 1 }
-        $__list = New-Object System.Collections.Generic.List[object]
-        $__dicts = New-Object System.Collections.Generic.List[object]
-        $__n = $__frames.Count
-        for ($__k = 0; $__k -lt $__n; $__k++) {
-            if ($__k -eq $__n - 1) { $__label = 'Script' } elseif ($__k -eq 0) { $__label = 'Local' } else { $__label = "Caller $__k" }
-            if ($__k -lt $__n - 1 -and $__frames[$__k].Command) { $__label = "$__label ($($__frames[$__k].Command))" }
-            $__d = $__frames[$__k].GetFrameVariables()
-            $__dicts.Add($__d)
-            foreach ($__kv in $__d.GetEnumerator()) {
-                if ($__kv.Key -like '__Dbg*') { continue }
-                $__list.Add((__DbgVarEntry $__kv.Key $__kv.Value.Value $__label ($__k + 1)))
-            }
-        }
-        foreach ($__v in (Get-Variable -Scope Global)) {
-            if ($__v.Name -like '__Dbg*' -or $__v.Name -eq 'args' -or $global:__DbgAuto.ContainsKey($__v.Name)) { continue }
-            $__list.Add((__DbgVarEntry $__v.Name $__v.Value 'Global' 'Global'))
-        }
-        $global:__DbgSeq++
-        $__json = ConvertTo-Json -InputObject $__list.ToArray() -Compress -Depth 3
-        [IO.File]::WriteAllText((Join-Path $global:__DbgStateDir "vars_$($global:__DbgSeq).json"), $__json, [Text.Encoding]::UTF8)
-        __DbgMsg "asmload|$($a.FullName)|$__loc|$PID"
-        [Console]::Out.WriteLine("__DBG_STOP__ $__line $__depth $($global:__DbgStmtEnd) $($global:__DbgGen) $($global:__DbgSeq)")
-        [Console]::Out.Flush()
-        __DbgWaitLoop 0 $__dicts
-    } finally { $global:__DbgInAction = $false }
-}
-
-$global:__DbgAsmSource = @'
-using System;
-using System.Reflection;
-using System.Threading;
-public static class DbgAsmHook {
-    public static int MainThreadId;
-    public static volatile bool Enabled;
-    public static volatile bool PauseRequested;
-    public static string[] IgnorePrefixes = new string[0];
-    public static Action<Assembly> MainThreadCallback;
-    private static bool _hooked;
-    public static void Install(int mainThread, Action<Assembly> cb, string[] ignore) {
-        MainThreadId = mainThread; MainThreadCallback = cb; IgnorePrefixes = ignore ?? new string[0];
-        if (!_hooked) { AppDomain.CurrentDomain.AssemblyLoad += OnLoad; _hooked = true; }
-    }
-    private static void OnLoad(object sender, AssemblyLoadEventArgs e) {
-        if (!Enabled) return;
-        Assembly a = e.LoadedAssembly;
-        try { if (a.GlobalAssemblyCache) return; } catch { }
-        string loc = "";
-        try { if (!a.IsDynamic) loc = a.Location ?? ""; } catch { }
-        foreach (string p in IgnorePrefixes) { if (p.Length > 0 && loc.StartsWith(p, StringComparison.OrdinalIgnoreCase)) return; }
-        if (Thread.CurrentThread.ManagedThreadId == MainThreadId) {
-            Action<Assembly> cb = MainThreadCallback;
-            if (cb != null) { try { cb(a); } catch { } }
-        } else {
-            // PowerShell code cannot run on this thread; report, and make the script
-            // pause at its next statement.
-            try {
-                Console.Out.WriteLine("__DBG_MSG__ asmload-bg|" + a.FullName + "|" + loc + "|" + Thread.CurrentThread.ManagedThreadId);
-                Console.Out.Flush();
-            } catch { }
-            PauseRequested = true;
-        }
-    }
-}
-'@
-
-function global:__DbgInstallAsmHook {
-    try {
-        Add-Type -TypeDefinition $global:__DbgAsmSource -Language CSharp -ErrorAction Stop
-        $global:__DbgAsmType = [DbgAsmHook]
-        $__cb = [Action[System.Reflection.Assembly]]{ param($a) __DbgAsmStop $a }
-        [DbgAsmHook]::Install($global:__DbgMainThread, $__cb, @([string]$PSHOME, [string]$env:SystemRoot))
-        [DbgAsmHook]::Enabled = [bool]$global:__DbgCtl.asm
-        $global:__DbgAsmOn = $true
-        __DbgMsg 'info|Assembly-load pause is active.'
-    } catch {
-        __DbgMsg "info|Assembly-load pause could not be installed: $($_.Exception.Message)"
-    }
-}
-
 $global:__DbgAction = {
     $__ln = $_.Line
     if ($global:__DbgSw.ElapsedMilliseconds -ge 100) { if (__DbgRefreshControl) { __DbgSyncBreakpoints } }
@@ -669,24 +516,20 @@ $global:__DbgAction = {
     $__isBp = $__ctl.bps.Contains($__ln) -or ($__ctl.temp -eq $__ln)
     $__trackAll = ($__ctl.track -eq 'all')
     $__isCp = $__ctl.cps.Contains($__ln)
-    $__asmPause = $global:__DbgAsmOn -and $global:__DbgAsmType::PauseRequested
     # Fast path: nothing to do on this line.
-    if (-not $__isBp -and $__mode -eq 'run' -and -not $__trackAll -and -not $__isCp -and -not $__asmPause) { return }
-    if ($global:__DbgInjecting -or $global:__DbgInAction) { return }
-    $global:__DbgInAction = $true
-    try {
+    if (-not $__isBp -and $__mode -eq 'run' -and -not $__trackAll -and -not $__isCp) { return }
+    if ($global:__DbgInjecting) { return }
     $__stack = @(Get-PSCallStack)
     # A breakpoint on a line without a statement fires against the first statement that
     # does run; only the hit whose line matches the frame's current line is real.
     if ($__stack.Count -lt 2 -or $__stack[1].ScriptLineNumber -ne $__ln) { return }
     try { if ($__stack[1].Position.Text -like '__DbgCheck*') { return } } catch { }
     $__depth = $__stack.Count
-    $__stop = $__isBp -or $__asmPause -or $__mode -eq 'step' -or
+    $__stop = $__isBp -or $__mode -eq 'step' -or
               ($__mode -eq 'step_over' -and $__depth -le $__ctl.depth) -or
               ($__mode -eq 'step_out' -and $__depth -lt $__ctl.depth)
     if (-not $__stop -and -not $__trackAll -and -not $__isCp) { return }
     if ($__ctl.temp -eq $__ln) { $__ctl.temp = -1 }
-    if ($__asmPause) { $global:__DbgAsmType::PauseRequested = $false }
     $__list = New-Object System.Collections.Generic.List[object]
     $__scopes = New-Object System.Collections.Generic.List[object]
     $__i = 1
@@ -736,19 +579,45 @@ $global:__DbgAction = {
     }
     [Console]::Out.WriteLine("__DBG_STOP__ $__ln $__depth $($global:__DbgStmtEnd) $($global:__DbgGen) $($global:__DbgSeq)")
     [Console]::Out.Flush()
-    __DbgWaitLoop 1 $null
-    } finally { $global:__DbgInAction = $false }
+    while ($true) {
+        $__cmd = [Console]::In.ReadLine()
+        if ($null -eq $__cmd -or $__cmd -eq 'go') { break }
+        if ($__cmd.StartsWith('dump|')) {
+            $__parts = $__cmd.Split('|', 4)
+            try {
+                if ($__parts[1] -eq 'Global') { $__dv = Get-Variable -Scope Global -Name $__parts[2] -ErrorAction Stop }
+                else { $__dv = Get-Variable -Scope ([int]$__parts[1]) -Name $__parts[2] -ErrorAction Stop }
+                __DbgWriteValue $__dv.Value $__parts[3]
+                __DbgMsg "dump-ok|$($__parts[3])"
+            } catch { __DbgMsg "dump-error|$($_.Exception.Message)" }
+        } elseif ($__cmd.StartsWith('reload|')) {
+            $__parts = $__cmd.Split('|')
+            if ($global:__DbgStmtEnd -le 0) {
+                __DbgMsg "reload-error|Live editing is not available for this script (it uses begin/process/end blocks or using statements)."
+            } else {
+                $__t = $null; $__e = $null
+                try {
+                    $__src = [IO.File]::ReadAllText($global:__DbgSourceFile)
+                    $null = [System.Management.Automation.Language.Parser]::ParseInput($__src, [ref]$__t, [ref]$__e)
+                } catch { $__e = @($_.Exception.Message) }
+                if ($__e -and $__e.Count -gt 0) {
+                    $__m = $__e[0]
+                    if ($__m.Extent) { __DbgMsg "reload-error|Line $($__m.Extent.StartLineNumber): $($__m.Message)" }
+                    else { __DbgMsg "reload-error|$__m" }
+                } else {
+                    $global:__DbgReloadAfter = [int]$__parts[1]
+                    $global:__DbgReloadGen = [int]$__parts[2]
+                    __DbgMsg "reload-ok|$($__parts[2])"
+                }
+            }
+        }
+    }
+    $global:__DbgCtlTime = [DateTime]::MinValue
+    $null = __DbgRefreshControl
+    __DbgSyncBreakpoints
 }
 
 $null = __DbgRefreshControl
-if ($env:__DBG_ASM -eq '1') { __DbgInstallAsmHook }
-if ($env:__DBG_WAIT_START -eq '1') {
-    # Let the GUI attach a native debugger before any script code runs.
-    __DbgMsg "ready|$PID"
-    $null = [Console]::In.ReadLine()
-    $global:__DbgCtlTime = [DateTime]::MinValue
-    $null = __DbgRefreshControl
-}
 $__DbgText = [IO.File]::ReadAllText($global:__DbgSourceFile)
 $__DbgTokens = $null; $__DbgErrors = $null
 $__DbgAst = [System.Management.Automation.Language.Parser]::ParseInput($__DbgText, [ref]$__DbgTokens, [ref]$__DbgErrors)
@@ -764,9 +633,8 @@ if ($__DbgWhole) {
     [IO.File]::WriteAllText($global:__DbgShadow, $__DbgText, [Text.Encoding]::UTF8)
     __DbgSetBreakpoints ((($__DbgText -split "`n").Count) + 1)
     try {
-        $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgInUser = $true; & $global:__DbgShadow ' + $__DbgArgString)
+        $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; & $global:__DbgShadow ' + $__DbgArgString)
         & $__DbgInvoke
-        $global:__DbgInUser = $false
         if ($null -ne $LASTEXITCODE) { $__DbgExit = $LASTEXITCODE }
     } catch {
         [Console]::Error.WriteLine("Unhandled error: " + $_.Exception.Message)
@@ -790,9 +658,9 @@ if ($__DbgWhole) {
             [IO.File]::WriteAllText($global:__DbgShadow, $__DbgChunk, [Text.Encoding]::UTF8)
             __DbgSetBreakpoints ((($__DbgChunk -split "`n").Count) + 1)
             if ($__DbgInject) {
-                $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgInUser = $true; $global:__DbgTopDepth = @(Get-PSCallStack).Count + 2; & $global:__DbgShadow')
+                $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgTopDepth = @(Get-PSCallStack).Count + 2; & $global:__DbgShadow')
             } else {
-                $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgInUser = $true; $global:__DbgTopDepth = @(Get-PSCallStack).Count + 2; & $global:__DbgShadow ' + $__DbgArgString)
+                $__DbgInvoke = [scriptblock]::Create('$__DbgHarness = $true; $global:__DbgTopDepth = @(Get-PSCallStack).Count + 2; & $global:__DbgShadow ' + $__DbgArgString)
             }
             $global:__DbgInjecting = [bool]$__DbgInject
             $__DbgReload = $false
@@ -801,7 +669,7 @@ if ($__DbgWhole) {
             } catch {
                 if ($_.FullyQualifiedErrorId -eq '__DbgReload' -or $_.Exception.Message -eq '__DbgReload') { $__DbgReload = $true }
                 else { throw }
-            } finally { $global:__DbgInUser = $false }
+            }
             if (-not $__DbgReload) { break }
             # --- restart from the edited text ------------------------------------------
             $__DbgNewText = [IO.File]::ReadAllText($global:__DbgSourceFile)
@@ -847,283 +715,6 @@ if ($__DbgWhole) {
 [Console]::Out.Flush()
 exit $__DbgExit
 '''
-
-
-# ----------------------------------------------------------------------------
-# Process guard: the GUI acts as the native debugger of the script's whole process
-# tree so that every new process can be frozen before it executes and handed to a
-# real debugger.
-# ----------------------------------------------------------------------------
-
-from ctypes import wintypes  # noqa: E402
-
-_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_ntdll = ctypes.WinDLL("ntdll")
-DEBUG_PROCESS = 0x00000001
-DBG_CONTINUE = 0x00010002
-DBG_EXCEPTION_NOT_HANDLED = 0x80010001
-EXCEPTION_DEBUG_EVENT = 1
-CREATE_THREAD_DEBUG_EVENT = 2
-CREATE_PROCESS_DEBUG_EVENT = 3
-EXIT_THREAD_DEBUG_EVENT = 4
-EXIT_PROCESS_DEBUG_EVENT = 5
-LOAD_DLL_DEBUG_EVENT = 6
-UNLOAD_DLL_DEBUG_EVENT = 7
-OUTPUT_DEBUG_STRING_EVENT = 8
-BREAKPOINT_CODES = (0x80000003, 0x4000001F)      # EXCEPTION_BREAKPOINT, STATUS_WX86_BREAKPOINT
-THREAD_SUSPEND_RESUME = 0x0002
-PROCESS_TERMINATE = 0x0001
-
-
-class _EXCEPTION_RECORD(ctypes.Structure):
-    _fields_ = [("ExceptionCode", wintypes.DWORD), ("ExceptionFlags", wintypes.DWORD),
-                ("ExceptionRecord", ctypes.c_void_p), ("ExceptionAddress", ctypes.c_void_p),
-                ("NumberParameters", wintypes.DWORD), ("ExceptionInformation", ctypes.c_void_p * 15)]
-
-
-class _EXCEPTION_DEBUG_INFO(ctypes.Structure):
-    _fields_ = [("ExceptionRecord", _EXCEPTION_RECORD), ("dwFirstChance", wintypes.DWORD)]
-
-
-class _CREATE_PROCESS_DEBUG_INFO(ctypes.Structure):
-    _fields_ = [("hFile", wintypes.HANDLE), ("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
-                ("lpBaseOfImage", ctypes.c_void_p), ("dwDebugInfoFileOffset", wintypes.DWORD),
-                ("nDebugInfoSize", wintypes.DWORD), ("lpThreadLocalBase", ctypes.c_void_p),
-                ("lpStartAddress", ctypes.c_void_p), ("lpImageName", ctypes.c_void_p), ("fUnicode", wintypes.WORD)]
-
-
-class _LOAD_DLL_DEBUG_INFO(ctypes.Structure):
-    _fields_ = [("hFile", wintypes.HANDLE), ("lpBaseOfDll", ctypes.c_void_p), ("dwDebugInfoFileOffset", wintypes.DWORD),
-                ("nDebugInfoSize", wintypes.DWORD), ("lpImageName", ctypes.c_void_p), ("fUnicode", wintypes.WORD)]
-
-
-class _EXIT_INFO(ctypes.Structure):
-    _fields_ = [("dwExitCode", wintypes.DWORD)]
-
-
-class _DEBUG_EVENT_U(ctypes.Union):
-    _fields_ = [("Exception", _EXCEPTION_DEBUG_INFO), ("CreateProcessInfo", _CREATE_PROCESS_DEBUG_INFO),
-                ("LoadDll", _LOAD_DLL_DEBUG_INFO), ("Exit", _EXIT_INFO), ("_pad", ctypes.c_byte * 160)]
-
-
-class _DEBUG_EVENT(ctypes.Structure):
-    _fields_ = [("dwDebugEventCode", wintypes.DWORD), ("dwProcessId", wintypes.DWORD),
-                ("dwThreadId", wintypes.DWORD), ("u", _DEBUG_EVENT_U)]
-
-
-def _path_from_handle(handle):
-    if not handle:
-        return ""
-    buf = ctypes.create_unicode_buffer(1024)
-    n = _k32.GetFinalPathNameByHandleW(wintypes.HANDLE(handle), buf, 1024, 0)
-    if 0 < n < 1024:
-        p = buf.value
-        return p[4:] if p.startswith("\\\\?\\") else p
-    return ""
-
-
-def _image_of_process(hprocess):
-    buf = ctypes.create_unicode_buffer(1024)
-    size = wintypes.DWORD(1024)
-    if _k32.QueryFullProcessImageNameW(wintypes.HANDLE(hprocess), 0, buf, ctypes.byref(size)):
-        return buf.value
-    return ""
-
-
-def _parent_pid(hprocess):
-    info = (ctypes.c_void_p * 6)()
-    ret = wintypes.ULONG(0)
-    status = _ntdll.NtQueryInformationProcess(wintypes.HANDLE(hprocess), 0, info, ctypes.sizeof(info), ctypes.byref(ret))
-    if status == 0:
-        return int(info[5] or 0)
-    return 0
-
-
-class ProcessGuard:
-    """Runs the script process under DEBUG_PROCESS on a dedicated thread.
-
-    Every process in the tree is tracked. New processes are frozen at the configured
-    stages ('created', 'first') and reported to the GUI as ("guard", stage, info);
-    the GUI answers with resume / detach / kill.
-    """
-
-    STAGE_CREATED = "created"
-    STAGE_FIRST = "first"
-
-    def __init__(self, events, stages, log_dlls=False, ignore=("conhost.exe",)):
-        self.events = events
-        self.stages = set(stages)
-        self.log_dlls = log_dlls
-        self.ignore = {s.strip().lower() for s in ignore if s.strip()}
-        self.cmds = queue.Queue()
-        self.procs = {}           # pid -> dict(image, parent, hprocess, init_bp_pending, frozen, handles)
-        self.root_pid = None
-        self.stop_flag = False
-        self.proc = None
-        self.spawn_error = None
-        self.thread = None
-        self.finished = threading.Event()
-
-    # --- lifecycle ---------------------------------------------------------------
-    def start(self, popen_args, popen_kwargs):
-        ready = threading.Event()
-        self.thread = threading.Thread(target=self._run, args=(popen_args, popen_kwargs, ready), daemon=True)
-        self.thread.start()
-        ready.wait()
-        if self.spawn_error:
-            raise self.spawn_error
-        return self.proc
-
-    def command(self, action, pid):
-        self.cmds.put((action, pid))
-
-    def stop(self):
-        self.stop_flag = True
-
-    # --- debugger thread -------------------------------------------------------------
-    def _run(self, popen_args, popen_kwargs, ready):
-        try:
-            kwargs = dict(popen_kwargs)
-            kwargs["creationflags"] = kwargs.get("creationflags", 0) | DEBUG_PROCESS
-            self.proc = subprocess.Popen(popen_args, **kwargs)
-            self.root_pid = self.proc.pid
-        except Exception as exc:  # noqa: BLE001
-            self.spawn_error = exc
-            ready.set()
-            return
-        ready.set()
-        _k32.DebugSetProcessKillOnExit(False)
-        evt = _DEBUG_EVENT()
-        root_exited = False
-        try:
-            while True:
-                self._serve_commands()
-                if self.stop_flag and not self.procs:
-                    break
-                if root_exited and not self.procs:
-                    break
-                if not _k32.WaitForDebugEvent(ctypes.byref(evt), 100):
-                    if root_exited and not any(p.get("debugged") for p in self.procs.values()):
-                        break
-                    continue
-                code, pid, tid = evt.dwDebugEventCode, evt.dwProcessId, evt.dwThreadId
-                status = DBG_CONTINUE
-                try:
-                    if code == CREATE_PROCESS_DEBUG_EVENT:
-                        self._on_create(pid, tid, evt.u.CreateProcessInfo)
-                    elif code == EXIT_PROCESS_DEBUG_EVENT:
-                        self._on_exit(pid, evt.u.Exit.dwExitCode)
-                        if pid == self.root_pid:
-                            root_exited = True
-                    elif code == LOAD_DLL_DEBUG_EVENT:
-                        info = evt.u.LoadDll
-                        if self.log_dlls and pid != self.root_pid:
-                            self._log(f"[guard] PID {pid} loaded {_path_from_handle(info.hFile) or '<unknown dll>'}")
-                        if info.hFile:
-                            _k32.CloseHandle(info.hFile)
-                    elif code == EXCEPTION_DEBUG_EVENT:
-                        status = self._on_exception(pid, tid, evt.u.Exception)
-                except Exception as exc:  # noqa: BLE001
-                    self._log(f"[guard] error handling event {code} for PID {pid}: {exc}")
-                _k32.ContinueDebugEvent(pid, tid, status)
-        finally:
-            self.finished.set()
-
-    def _serve_commands(self):
-        while True:
-            try:
-                action, pid = self.cmds.get_nowait()
-            except queue.Empty:
-                return
-            info = self.procs.get(pid)
-            try:
-                if action == "resume":
-                    self._resume(pid)
-                elif action == "detach":
-                    if info and info.get("debugged"):
-                        if _k32.DebugActiveProcessStop(pid):
-                            info["debugged"] = False
-                            self._log(f"[guard] detached from PID {pid}; it stays frozen until you resume it")
-                        else:
-                            self._log(f"[guard] could not detach from PID {pid} (error {ctypes.get_last_error()})")
-                elif action == "kill":
-                    h = _k32.OpenProcess(PROCESS_TERMINATE, False, pid)
-                    if h:
-                        _k32.TerminateProcess(h, 1)
-                        _k32.CloseHandle(h)
-                    self._resume(pid)
-                    self._log(f"[guard] killed PID {pid}")
-            except Exception as exc:  # noqa: BLE001
-                self._log(f"[guard] {action} PID {pid} failed: {exc}")
-
-    def _resume(self, pid):
-        info = self.procs.get(pid)
-        if not info:
-            return
-        for h in info.get("frozen_threads", []):
-            _k32.ResumeThread(h)
-            _k32.CloseHandle(h)
-        if info.get("frozen_threads"):
-            self._log(f"[guard] resumed PID {pid}")
-        info["frozen_threads"] = []
-        if not info.get("debugged"):
-            self.procs.pop(pid, None)
-
-    def _freeze(self, pid, tid, stage, hthread=None):
-        info = self.procs[pid]
-        if hthread:
-            h = wintypes.HANDLE()
-            if not _k32.DuplicateHandle(_k32.GetCurrentProcess(), wintypes.HANDLE(hthread), _k32.GetCurrentProcess(),
-                                        ctypes.byref(h), THREAD_SUSPEND_RESUME, False, 0):
-                h = None
-            else:
-                h = h.value
-        else:
-            h = _k32.OpenThread(THREAD_SUSPEND_RESUME, False, tid)
-        if not h:
-            self._log(f"[guard] could not freeze PID {pid} (error {ctypes.get_last_error()})")
-            return
-        _k32.SuspendThread(h)
-        info.setdefault("frozen_threads", []).append(h)
-        self.events.put(("guard", stage, {"pid": pid, "tid": tid, "image": info["image"], "parent": info["parent"]}))
-
-    def _on_create(self, pid, tid, cp):
-        image = _path_from_handle(cp.hFile) or _image_of_process(cp.hProcess) or "<unknown image>"
-        parent = _parent_pid(cp.hProcess)
-        self.procs[pid] = {"image": image, "parent": parent, "init_bp_pending": True, "debugged": True,
-                           "frozen_threads": []}
-        if cp.hFile:
-            _k32.CloseHandle(cp.hFile)
-        if pid == self.root_pid:
-            return
-        ignored = os.path.basename(image).lower() in self.ignore
-        self.procs[pid]["ignored"] = ignored
-        note = " [ignored]" if ignored else ""
-        self._log(f"[guard] new process PID {pid}: {image} (created by PID {parent}){note}")
-        if self.STAGE_CREATED in self.stages and not ignored:
-            self._freeze(pid, tid, self.STAGE_CREATED, cp.hThread)
-
-    def _on_exit(self, pid, code):
-        info = self.procs.pop(pid, None)
-        if info and pid != self.root_pid:
-            self._log(f"[guard] PID {pid} exited with code {code} ({os.path.basename(info['image'])})")
-        if info:
-            for h in info.get("frozen_threads", []):
-                _k32.CloseHandle(h)
-
-    def _on_exception(self, pid, tid, ex):
-        code = ex.ExceptionRecord.ExceptionCode
-        info = self.procs.get(pid)
-        if code in BREAKPOINT_CODES:
-            if info and info.get("init_bp_pending"):
-                info["init_bp_pending"] = False
-                if pid != self.root_pid and self.STAGE_FIRST in self.stages and not info.get("ignored"):
-                    self._freeze(pid, tid, self.STAGE_FIRST)
-            return DBG_CONTINUE
-        return DBG_EXCEPTION_NOT_HANDLED
-
-    def _log(self, text):
-        self.events.put(("output", text + "\n"))
 
 
 # ----------------------------------------------------------------------------
@@ -1174,12 +765,6 @@ class DebugSession:
         self.mode = "run"
         self.mode_depth = 0                 # absolute depth as reported by the script
         self.track = TRACK_POINTS
-        self.asm_pause = False              # PowerShell: pause when the script loads an assembly
-        self.wait_start = False             # emit 'ready' and wait before running any script code
-        self.guard_stages = ()              # ProcessGuard freeze stages, empty = guard off
-        self.guard_log_dlls = False
-        self.guard_ignore = ("conhost.exe",)
-        self.guard = None
         self.state_dir = tempfile.mkdtemp(prefix="scriptdbg_")
         self.encoding = "utf-8"
         self._stdin_lock = threading.Lock()
@@ -1243,7 +828,7 @@ class DebugSession:
             return
         with self.lock:
             ctl = {"mode": self.mode, "depth": self.mode_depth, "temp": self.temp_breakpoint or -1,
-                   "track": self.track, "asm": bool(self.asm_pause)}
+                   "track": self.track}
         ctl["bps"] = self._control_lines("bps")
         ctl["cps"] = self._control_lines("cps")
         try:
@@ -1264,19 +849,17 @@ class DebugSession:
     def start(self):
         cmd, env, cwd = self._build()
         self.write_control()
-        kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                      cwd=cwd, env=env, creationflags=CREATE_NO_WINDOW)
-        if self.guard_stages:
-            self.guard = ProcessGuard(self.events, self.guard_stages, self.guard_log_dlls, self.guard_ignore)
-            self.proc = self.guard.start(cmd, kwargs)
-        else:
-            self.proc = subprocess.Popen(cmd, **kwargs)
+        self.proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=cwd,
+            env=env,
+            creationflags=CREATE_NO_WINDOW,
+        )
         self.started = True
         threading.Thread(target=self._reader, daemon=True).start()
-
-    def guard_command(self, action, pid):
-        if self.guard:
-            self.guard.command(action, pid)
 
     def resume(self, mode, depth_abs=0):
         self.set_mode(mode, depth_abs)
@@ -1302,10 +885,6 @@ class DebugSession:
 
     def stop(self):
         self.killed = True
-        if self.guard:
-            self.guard.stop()
-            for pid in list(self.guard.procs):
-                self.guard.command("kill", pid)
         if self.proc and self.proc.poll() is None:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
@@ -1474,7 +1053,6 @@ class BatchSession(DebugSession):
             fh.write(data)
         env = dict(os.environ)
         env["__DBG_DIR"] = self.state_dir
-        env["__DBG_WAIT_START"] = "1" if self.wait_start else "0"
         inner = f'"{self.shadow_path}"'
         if self.args.strip():
             inner += " " + self.args.strip()
@@ -1577,8 +1155,6 @@ class PowerShellSession(DebugSession):
         cmd = [self.ps_exe, "-NoProfile", "-NoLogo", "-ExecutionPolicy", "Bypass", "-Command", command]
         env = dict(os.environ)
         env["__DBG_ARGS"] = self.args.strip()
-        env["__DBG_WAIT_START"] = "1" if self.wait_start else "0"
-        env["__DBG_ASM"] = "1" if self.asm_pause else "0"
         return cmd, env, os.path.dirname(self.script_path)
 
     def _read_vars(self, seq):
@@ -1660,45 +1236,6 @@ def _bp_store_path():
     folder = os.path.join(base, "ScriptDebugger")
     os.makedirs(folder, exist_ok=True)
     return os.path.join(folder, "breakpoints.json")
-
-
-DEBUGGER_PRESETS = [
-    ("WinDbg (windbgx)", 'windbgx.exe -p {pid} -c ".childdbg 1; sxe cpr; g"'),
-    ("WinDbg classic", 'windbg.exe -p {pid} -c ".childdbg 1; sxe cpr; g"'),
-    ("x64dbg", "x64dbg.exe -p {pid}"),
-    ("dnSpy (then Debug > Attach to Process)", "dnSpy.exe"),
-    ("Custom", ""),
-]
-DEFAULT_SETTINGS = {"native_template": DEBUGGER_PRESETS[0][1], "attach_at_start": False, "asm_pause": False,
-                    "guard": False, "guard_created": False, "guard_first": True, "guard_dlls": False,
-                    "guard_ignore": "conhost.exe"}
-
-
-def _settings_path():
-    base = os.environ.get("APPDATA") or os.path.expanduser("~")
-    folder = os.path.join(base, "ScriptDebugger")
-    os.makedirs(folder, exist_ok=True)
-    return os.path.join(folder, "settings.json")
-
-
-def load_settings():
-    data = dict(DEFAULT_SETTINGS)
-    try:
-        with open(_settings_path(), "r", encoding="utf-8") as fh:
-            saved = json.load(fh)
-        if isinstance(saved, dict):
-            data.update({k: saved[k] for k in DEFAULT_SETTINGS if k in saved})
-    except Exception:  # noqa: BLE001
-        pass
-    return data
-
-
-def save_settings(data):
-    try:
-        with open(_settings_path(), "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=1)
-    except Exception:  # noqa: BLE001
-        pass
 
 
 def load_saved_points(path):
@@ -2248,8 +1785,6 @@ class DebuggerApp(tk.Tk):
         self.last_line = None
         self.state = "idle"
         self.edits_pending = False
-        self.settings = load_settings()
-        self.pending_asm_note = None
 
         self._build_menu()
         self._build_toolbar()
@@ -2287,9 +1822,6 @@ class DebuggerApp(tk.Tk):
         dbg.add_command(label="Toggle capture point at cursor", accelerator="Ctrl+F9",
                         command=lambda: self.toggle_capture_point(self.code.cursor_line))
         dbg.add_command(label="Clear all breakpoints and capture points", command=self.clear_points)
-        dbg.add_separator()
-        dbg.add_command(label="Attach native debugger now", command=self.attach_native_debugger)
-        dbg.add_command(label="Native debugger settings...", command=self.native_debugger_settings)
         menubar.add_cascade(label="Debug", menu=dbg)
         helpm = tk.Menu(menubar, tearoff=0)
         helpm.add_command(label="How it works", command=self.show_help)
@@ -2320,8 +1852,6 @@ class DebuggerApp(tk.Tk):
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=4)
         self.btn_apply = ttk.Button(bar, text="Apply edits", command=self.apply_edits)
         self.btn_apply.pack(side="left", padx=2)
-        self.btn_attach = ttk.Button(bar, text="Attach debugger", command=self.attach_native_debugger)
-        self.btn_attach.pack(side="left", padx=2)
         ttk.Separator(bar, orient="vertical").pack(side="left", fill="y", padx=4)
         ttk.Label(bar, text="Track vars:").pack(side="left")
         self.track_var = tk.StringVar(value=TRACK_CHOICES[0][0])
@@ -2423,7 +1953,6 @@ class DebuggerApp(tk.Tk):
         en(self.btn_stop, running or paused)
         en(self.btn_save, bool(self.script_path))
         en(self.btn_apply, paused and self.edits_pending)
-        en(self.btn_attach, running or paused)
         self.code.set_editable(loaded or paused)
         if self.kind == "powershell":
             self.ps_label.pack(side="left")
@@ -2783,22 +2312,6 @@ class DebuggerApp(tk.Tk):
             self.session.mode = mode
             self.session.track = self._track_mode()
             self.session.temp_breakpoint = temp_bp
-            self.session.asm_pause = bool(self.settings.get("asm_pause")) and self.kind == "powershell"
-            self.session.wait_start = bool(self.settings.get("attach_at_start"))
-            if self.settings.get("guard"):
-                stages = []
-                if self.settings.get("guard_created"):
-                    stages.append(ProcessGuard.STAGE_CREATED)
-                if self.settings.get("guard_first", True):
-                    stages.append(ProcessGuard.STAGE_FIRST)
-                self.session.guard_stages = tuple(stages) or (ProcessGuard.STAGE_FIRST,)
-                self.session.guard_log_dlls = bool(self.settings.get("guard_dlls"))
-                self.session.guard_ignore = tuple((self.settings.get("guard_ignore") or "").split(","))
-                if self.session.wait_start and self.settings.get("attach_at_start"):
-                    self._append_output("[debugger] process guard is on: this debugger is the native debugger of "
-                                        "the script process, so no other debugger can attach to it; new child "
-                                        "processes can be handed off instead\n", "dbg")
-        self.pending_asm_note = None
         self.vars_table.clear()
         self.history.clear()
         self.clear_output()
@@ -2893,26 +2406,6 @@ class DebuggerApp(tk.Tk):
                 self._append_output(f"[debugger] edited script is now in effect (next statement at line {nxt})\n", "dbg")
             elif mkind == "info":
                 self._append_output(f"[debugger] {payload}\n", "dbg")
-            elif mkind == "ready":
-                self._on_ready()
-            elif mkind in ("asmload", "asmload-bg"):
-                parts = payload.split("|")
-                name = parts[0] if parts else "?"
-                loc = parts[1] if len(parts) > 1 and parts[1] else "loaded from memory, no file on disk"
-                pid = self.session.proc.pid if self.session and self.session.proc else "?"
-                if mkind == "asmload":
-                    self.pending_asm_note = (f"Assembly loaded: {name} ({loc}). None of its code has run yet. "
-                                             f"PID {pid}: use Attach debugger to hand off.")
-                    self._append_output(f"[debugger] assembly loaded on the script thread: {name} ({loc})\n", "dbg")
-                else:
-                    thread = parts[3] if len(parts) > 3 else "?"
-                    self.pending_asm_note = (f"Assembly {name} was loaded by background thread {thread} ({loc}); "
-                                             f"its code may already be running. PID {pid}.")
-                    self._append_output(f"[debugger] assembly loaded on background thread {thread}: {name} ({loc}); "
-                                        f"pausing at the next statement\n", "dbg")
-        elif kind == "guard":
-            _, stage, info = ev
-            self._on_guard(stage, info)
         elif kind == "stop":
             _, line, depth, variables, paused, stmt_end = ev
             self._apply_variables(line, variables, paused)
@@ -2922,12 +2415,8 @@ class DebuggerApp(tk.Tk):
                 where = f"line {line}"
                 if self.session and self.session.supports_depth and depth > 0:
                     where += f" (call depth {depth})"
-                if self.pending_asm_note:
-                    self._status(f"Paused before {where}. {self.pending_asm_note}")
-                    self.pending_asm_note = None
-                else:
-                    self._status(f"Paused before {where}. F5 continue, F11 step into, F10 step over. "
-                                 f"You can edit the script now.")
+                self._status(f"Paused before {where}. F5 continue, F11 step into, F10 step over. "
+                             f"You can edit the script now.")
         elif kind == "end":
             _, code, killed = ev
             self.code.set_current(None)
@@ -2989,195 +2478,6 @@ class DebuggerApp(tk.Tk):
         self.output.configure(state="normal")
         self.output.delete("1.0", "end")
         self.output.configure(state="disabled")
-
-    # --- native debugger hand-off ---------------------------------------------------
-    def _on_ready(self):
-        """The script process is up and waiting before its first line."""
-        if not self.session:
-            return
-        pid = self.session.proc.pid
-        self.session.paused = True
-        self.session.current_line = None
-        self.code.set_current(None)
-        self._set_state("paused")
-        if self.settings.get("attach_at_start") and not self.session.guard:
-            ok = self.attach_native_debugger()
-            if ok:
-                self._status(f"Waiting before the first line. Native debugger launched for PID {pid}: set its "
-                             f"breakpoints, then Continue (F5) or Step Into (F11).")
-                return
-        self._status(f"Waiting before the first line (PID {pid}). Attach a debugger, then Continue (F5) or "
-                     f"Step Into (F11).")
-
-    def _on_guard(self, stage, info):
-        """A process in the script's tree is frozen; let the user decide what happens to it."""
-        pid, image, parent = info["pid"], info["image"], info["parent"]
-        when = "at its first instruction (image mapped, nothing executed yet)" if stage == ProcessGuard.STAGE_FIRST \
-            else "at creation (still empty; its creator may inject into it before resuming it)"
-        self._append_output(f"[guard] PID {pid} frozen {when}: {image}\n", "dbg")
-        self._status(f"Process {pid} ({os.path.basename(image)}) frozen {stage}. Decide in the pop-up.")
-        win = tk.Toplevel(self)
-        win.title(f"Process frozen: PID {pid}")
-        win.transient(self)
-        win.attributes("-topmost", True)
-        frm = ttk.Frame(win, padding=12)
-        frm.pack(fill="both", expand=True)
-        ttk.Label(frm, text=f"{os.path.basename(image)}   (PID {pid}, created by PID {parent})",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
-        ttk.Label(frm, text=image, foreground="#7a8290").pack(anchor="w")
-        ttk.Label(frm, text=f"Frozen {when}.", wraplength=520, justify="left").pack(anchor="w", pady=(8, 0))
-        state = {"detached": False}
-        msg = ttk.Label(frm, text="", wraplength=520, justify="left", foreground="#1f4fb8")
-        msg.pack(anchor="w", pady=(6, 0))
-        btns = ttk.Frame(frm)
-        btns.pack(fill="x", pady=(12, 0))
-        session = self.session
-
-        def handoff():
-            session.guard_command("detach", pid)
-            state["detached"] = True
-            template = (self.settings.get("native_template") or "").strip()
-            launched = False
-            if template:
-                cmd = template.replace("{pid}", str(pid))
-                try:
-                    subprocess.Popen(cmd)
-                    launched = True
-                    self._append_output(f"[debugger] launched: {cmd}\n", "dbg")
-                except OSError as exc:
-                    self._append_output(f"[debugger] could not start the debugger ({exc}); attach manually to PID {pid}\n", "dbg")
-            msg.configure(text=(f"Detached. {'Debugger launched for' if launched else 'Attach your debugger to'} PID {pid}. "
-                                f"The process stays frozen until you press Resume here (or resume its thread in the "
-                                f"debugger: WinDbg ~*m, x64dbg thread list)."))
-            b_handoff.state(["disabled"])
-
-        def resume():
-            session.guard_command("resume", pid)
-            win.destroy()
-
-        def kill():
-            session.guard_command("kill", pid)
-            win.destroy()
-
-        b_handoff = ttk.Button(btns, text="Hand off to debugger", command=handoff)
-        b_handoff.pack(side="left")
-        ttk.Button(btns, text="Resume", command=resume).pack(side="left", padx=6)
-        ttk.Button(btns, text="Kill", command=kill).pack(side="left")
-        win.protocol("WM_DELETE_WINDOW", lambda: None)
-
-    def attach_native_debugger(self):
-        """Launch the configured native debugger against the script's process. Returns True on launch."""
-        if not (self.session and self.session.proc and self.session.proc.poll() is None):
-            self._status("No running script process to attach to.")
-            return False
-        if self.session.guard:
-            messagebox.showinfo(APP_TITLE, "The process guard is on, so this debugger is already the native debugger "
-                                           "of the script process and another one cannot attach to it. New child "
-                                           "processes are offered for hand-off as they appear.")
-            return False
-        pid = self.session.proc.pid
-        template = (self.settings.get("native_template") or "").strip()
-        if not template:
-            messagebox.showinfo(APP_TITLE, f"No debugger command is configured (Debug > Native debugger settings).\n\n"
-                                           f"The script's process ID is {pid}.")
-            return False
-        cmd = template.replace("{pid}", str(pid))
-        try:
-            subprocess.Popen(cmd)
-        except OSError as exc:
-            messagebox.showerror(APP_TITLE, f"Could not start the debugger:\n{cmd}\n\n{exc}\n\n"
-                                            f"Edit the command in Debug > Native debugger settings (use the full "
-                                            f"path to the executable). The script's process ID is {pid}.")
-            return False
-        self._append_output(f"[debugger] launched: {cmd}\n", "dbg")
-        self._status(f"Debugger launched for PID {pid}. The script stays {self.state} until you continue it here.")
-        return True
-
-    def native_debugger_settings(self):
-        win = tk.Toplevel(self)
-        win.title("Native debugger settings")
-        win.transient(self)
-        win.resizable(False, False)
-        frm = ttk.Frame(win, padding=12)
-        frm.pack(fill="both", expand=True)
-        attach_var = tk.BooleanVar(value=bool(self.settings.get("attach_at_start")))
-        asm_var = tk.BooleanVar(value=bool(self.settings.get("asm_pause")))
-        tmpl_var = tk.StringVar(value=self.settings.get("native_template") or "")
-        preset_var = tk.StringVar(value="Custom")
-        for label, tmpl in DEBUGGER_PRESETS:
-            if tmpl and tmpl == tmpl_var.get():
-                preset_var.set(label)
-        ttk.Label(frm, text="Debugger command ({pid} is replaced by the script's process ID):").grid(
-            row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(frm, text="Preset:").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        preset = ttk.Combobox(frm, textvariable=preset_var, state="readonly", width=44,
-                              values=[p[0] for p in DEBUGGER_PRESETS])
-        preset.grid(row=1, column=1, sticky="w", pady=(6, 0))
-
-        def on_preset(event=None):
-            for label, tmpl in DEBUGGER_PRESETS:
-                if label == preset_var.get() and tmpl:
-                    tmpl_var.set(tmpl)
-        preset.bind("<<ComboboxSelected>>", on_preset)
-        ttk.Label(frm, text="Command:").grid(row=2, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(frm, textvariable=tmpl_var, width=70).grid(row=2, column=1, sticky="w", pady=(6, 0))
-        ttk.Checkbutton(frm, text="Attach the debugger before the script's first line runs (Run waits for you "
-                                  "to Continue)", variable=attach_var).grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
-        ttk.Checkbutton(frm, text="PowerShell: pause the script the moment it loads an assembly (in-memory loads "
-                                  "included), before any of its code runs", variable=asm_var).grid(
-            row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        guard_var = tk.BooleanVar(value=bool(self.settings.get("guard")))
-        gc_var = tk.BooleanVar(value=bool(self.settings.get("guard_created")))
-        gf_var = tk.BooleanVar(value=bool(self.settings.get("guard_first", True)))
-        gd_var = tk.BooleanVar(value=bool(self.settings.get("guard_dlls")))
-        ttk.Checkbutton(frm, text="Process guard: freeze every new process in the script's tree (children, "
-                                  "grandchildren, suspended ones) before it executes and offer it for hand-off",
-                        variable=guard_var).grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        gfrm = ttk.Frame(frm)
-        gfrm.grid(row=6, column=0, columnspan=2, sticky="w", padx=(24, 0))
-        ttk.Label(gfrm, text="Freeze each new process:").pack(side="left")
-        ttk.Checkbutton(gfrm, text="at its first instruction", variable=gf_var).pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(gfrm, text="at creation", variable=gc_var).pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(gfrm, text="log native DLL loads", variable=gd_var).pack(side="left", padx=(12, 0))
-        gi_var = tk.StringVar(value=self.settings.get("guard_ignore") or "")
-        gifrm = ttk.Frame(frm)
-        gifrm.grid(row=7, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(4, 0))
-        ttk.Label(gifrm, text="Never freeze these images (comma-separated):").pack(side="left")
-        ttk.Entry(gifrm, textvariable=gi_var, width=36).pack(side="left", padx=(6, 0))
-        ttk.Label(frm, foreground="#7a8290", justify="left", wraplength=620, text=(
-            "WinDbg: .childdbg 1 debugs every child process the script creates (including ones created suspended "
-            "for hollowing); sxe cpr breaks on each process creation. Add sxe ld:<name> or bp ntdll!NtMapViewOfSection "
-            "etc. as needed. Assemblies loaded from memory never produce a native module-load event, which is what "
-            "the assembly-load pause is for. Assemblies from $PSHOME, the Windows folder and the GAC are ignored. "
-            "Loads on background threads cannot pause instantly; they are reported and the script pauses at its "
-            "next statement. Changing the assembly-load option takes effect on the next run.\n\n"
-            "Process guard: 'first instruction' is the moment a hollowed process has its injected image in place "
-            "and is about to run it; 'creation' is before the creator has touched it. While the guard is on, no "
-            "other debugger can attach to the script process itself (Windows allows one debugger per process); "
-            "handing off a child detaches the guard from that child only. The script process sees "
-            "IsDebuggerPresent() = true. Takes effect on the next run.")).grid(
-            row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
-        btns = ttk.Frame(frm)
-        btns.grid(row=9, column=0, columnspan=2, sticky="e", pady=(12, 0))
-
-        def save():
-            self.settings["native_template"] = tmpl_var.get().strip()
-            self.settings["attach_at_start"] = bool(attach_var.get())
-            self.settings["asm_pause"] = bool(asm_var.get())
-            self.settings["guard"] = bool(guard_var.get())
-            self.settings["guard_created"] = bool(gc_var.get())
-            self.settings["guard_first"] = bool(gf_var.get())
-            self.settings["guard_dlls"] = bool(gd_var.get())
-            self.settings["guard_ignore"] = gi_var.get().strip()
-            save_settings(self.settings)
-            if self.session:
-                self.session.asm_pause = self.settings["asm_pause"] and self.kind == "powershell"
-                self.session.write_control()
-            win.destroy()
-        ttk.Button(btns, text="Save", command=save).pack(side="right")
-        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right", padx=(0, 6))
-        win.grab_set()
 
     # --- misc ----------------------------------------------------------------------
     def show_help(self):
