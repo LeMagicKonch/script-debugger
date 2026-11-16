@@ -127,15 +127,28 @@ were already there before the script started (PATH, `$PSVersionTable`, ...).
 
    - *Process guard*: the debugger launches the script's process as its own debuggee
      (Windows `DEBUG_PROCESS`), which automatically covers every descendant: children,
-     grandchildren, and processes created suspended and resumed later. Each new process is
-     frozen at its first instruction (optionally also at creation) and a pop-up offers
-     *Hand off to debugger* (detach from that process, keep it frozen, launch your debugger
-     command against its PID, then *Resume* when your breakpoints are set), *Resume* or
-     *Kill*. Images listed under *Never freeze* (default `conhost.exe`) are only logged.
-     While the guard is on, no other debugger can attach to the script process itself, so
-     it is an alternative to *Attach before the first line*, not an addition to it. The
-     script process sees `IsDebuggerPresent()` as true. `samples\spawn.ps1` demonstrates a
-     child created suspended, resumed, and spawning a grandchild.
+     grandchildren, and processes created suspended and resumed later. Each new process can
+     be frozen at creation, at its first native instruction, and/or the moment it loads the
+     .NET runtime (`clr.dll`/`coreclr.dll`) — independently selectable, since they serve
+     different payloads:
+     - *At creation* / *at first instruction* catch a native payload before it runs. A pop-up
+       offers *Hand off to debugger* (detach, keep it frozen, launch a **native** debugger
+       command — WinDbg or x64dbg — against its PID, then *Resume* once your
+       breakpoints are set), *Resume*, or *Kill*.
+     - *At .NET/CLR load* catches a **managed (.NET) payload** instead, and is the one to use
+       for "most PowerShell malware ends up executing .NET payloads": a process only needs to
+       load the CLR to run managed code at all, so this fires even when a hollowing loader
+       redirects the thread's entry point to skip the native "first instruction" trap
+       entirely. The pop-up's hand-off here launches the **managed** debugger configured for
+       assembly-load pause / attach-at-start (dnSpy etc.), since the runtime exists but hasn't
+       run the payload's `Main` yet — this is the combination that makes dnSpy useful
+       against an externally hollowed process, not just against PowerShell's own `Assembly.Load`.
+     Images listed under *Never freeze* (default `conhost.exe`) are only logged. While the
+     guard is on, no other debugger can attach to the script process itself, so it is an
+     alternative to *Attach before the first line*, not an addition to it. The script process
+     sees `IsDebuggerPresent()` as true. `samples\spawn.ps1` demonstrates a native child
+     created suspended, resumed, and spawning a grandchild; `samples\spawn_clr.ps1`
+     demonstrates the same pattern with a .NET target, for the CLR-load stage.
 
 ## Analysing hostile scripts
 

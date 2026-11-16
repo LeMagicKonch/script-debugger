@@ -949,6 +949,8 @@ class ProcessGuard:
 
     STAGE_CREATED = "created"
     STAGE_FIRST = "first"
+    STAGE_CLR = "clr"
+    CLR_DLLS = {"clr.dll", "coreclr.dll", "mscorwks.dll"}   # .NET Framework / .NET Core / legacy CLR 2.0
 
     def __init__(self, events, stages, log_dlls=False, ignore=("conhost.exe",)):
         self.events = events
@@ -1016,11 +1018,7 @@ class ProcessGuard:
                         if pid == self.root_pid:
                             root_exited = True
                     elif code == LOAD_DLL_DEBUG_EVENT:
-                        info = evt.u.LoadDll
-                        if self.log_dlls and pid != self.root_pid:
-                            self._log(f"[guard] PID {pid} loaded {_path_from_handle(info.hFile) or '<unknown dll>'}")
-                        if info.hFile:
-                            _k32.CloseHandle(info.hFile)
+                        self._on_load_dll(pid, tid, evt.u.LoadDll)
                     elif code == EXCEPTION_DEBUG_EVENT:
                         status = self._on_exception(pid, tid, evt.u.Exception)
                 except Exception as exc:  # noqa: BLE001
@@ -1091,7 +1089,7 @@ class ProcessGuard:
         image = _path_from_handle(cp.hFile) or _image_of_process(cp.hProcess) or "<unknown image>"
         parent = _parent_pid(cp.hProcess)
         self.procs[pid] = {"image": image, "parent": parent, "init_bp_pending": True, "debugged": True,
-                           "frozen_threads": []}
+                           "frozen_threads": [], "clr_frozen": False}
         if cp.hFile:
             _k32.CloseHandle(cp.hFile)
         if pid == self.root_pid:
@@ -1102,6 +1100,26 @@ class ProcessGuard:
         self._log(f"[guard] new process PID {pid}: {image} (created by PID {parent}){note}")
         if self.STAGE_CREATED in self.stages and not ignored:
             self._freeze(pid, tid, self.STAGE_CREATED, cp.hThread)
+
+    def _on_load_dll(self, pid, tid, dll):
+        """Fires for every DLL any guarded process loads, including a hollowed one, since
+        Windows delivers it to whichever process is the active debugger regardless of how
+        the thread got there. clr.dll/coreclr.dll loading is how we catch a .NET payload
+        before any of its managed code runs, including when a hollowing loader redirects
+        the thread's entry point directly and so never hits the native 'first instruction'
+        trap: the redirected code still has to load the CLR to run .NET code at all, and
+        that load is always visible here.
+        """
+        path = _path_from_handle(dll.hFile) if (self.log_dlls or self.STAGE_CLR in self.stages) else ""
+        if dll.hFile:
+            _k32.CloseHandle(dll.hFile)
+        if self.log_dlls and pid != self.root_pid:
+            self._log(f"[guard] PID {pid} loaded {path or '<unknown dll>'}")
+        info = self.procs.get(pid)
+        if (info and pid != self.root_pid and self.STAGE_CLR in self.stages and not info.get("ignored")
+                and not info.get("clr_frozen") and os.path.basename(path).lower() in self.CLR_DLLS):
+            info["clr_frozen"] = True
+            self._freeze(pid, tid, self.STAGE_CLR)
 
     def _on_exit(self, pid, code):
         info = self.procs.pop(pid, None)
@@ -1672,8 +1690,8 @@ DEBUGGER_PRESETS = [
 MANAGED_DEBUGGER_NAMES = ("dnspy", "ilspy", "dotpeek", "visual studio", "vsdbg", "devenv")
 
 DEFAULT_SETTINGS = {"native_template": DEBUGGER_PRESETS[0][1], "attach_at_start": False, "asm_pause": False,
-                    "guard": False, "guard_created": False, "guard_first": True, "guard_dlls": False,
-                    "guard_ignore": "conhost.exe", "guard_template": DEBUGGER_PRESETS[0][1]}
+                    "guard": False, "guard_created": False, "guard_first": True, "guard_clr": True,
+                    "guard_dlls": False, "guard_ignore": "conhost.exe", "guard_template": DEBUGGER_PRESETS[0][1]}
 
 
 def _settings_path():
@@ -2793,6 +2811,8 @@ class DebuggerApp(tk.Tk):
                     stages.append(ProcessGuard.STAGE_CREATED)
                 if self.settings.get("guard_first", True):
                     stages.append(ProcessGuard.STAGE_FIRST)
+                if self.settings.get("guard_clr", True):
+                    stages.append(ProcessGuard.STAGE_CLR)
                 self.session.guard_stages = tuple(stages) or (ProcessGuard.STAGE_FIRST,)
                 self.session.guard_log_dlls = bool(self.settings.get("guard_dlls"))
                 self.session.guard_ignore = tuple((self.settings.get("guard_ignore") or "").split(","))
@@ -3014,8 +3034,13 @@ class DebuggerApp(tk.Tk):
     def _on_guard(self, stage, info):
         """A process in the script's tree is frozen; let the user decide what happens to it."""
         pid, image, parent = info["pid"], info["image"], info["parent"]
-        when = "at its first instruction (image mapped, nothing executed yet)" if stage == ProcessGuard.STAGE_FIRST \
-            else "at creation (still empty; its creator may inject into it before resuming it)"
+        is_clr = stage == ProcessGuard.STAGE_CLR
+        if is_clr:
+            when = "right as it loaded the .NET runtime (clr.dll/coreclr.dll mapped; no managed code has run yet)"
+        elif stage == ProcessGuard.STAGE_FIRST:
+            when = "at its first instruction (image mapped, nothing executed yet)"
+        else:
+            when = "at creation (still empty; its creator may inject into it before resuming it)"
         self._append_output(f"[guard] PID {pid} frozen {when}: {image}\n", "dbg")
         self._status(f"Process {pid} ({os.path.basename(image)}) frozen {stage}. Decide in the pop-up.")
         win = tk.Toplevel(self)
@@ -3038,10 +3063,11 @@ class DebuggerApp(tk.Tk):
         def handoff():
             session.guard_command("detach", pid)
             state["detached"] = True
-            template = (self.settings.get("guard_template") or "").strip()
+            setting_key = "native_template" if is_clr else "guard_template"
+            template = (self.settings.get(setting_key) or "").strip()
             launched = False
             if template:
-                if any(name in template.lower() for name in MANAGED_DEBUGGER_NAMES):
+                if not is_clr and any(name in template.lower() for name in MANAGED_DEBUGGER_NAMES):
                     msg.configure(text=(
                         f"The configured process-guard debugger ({template}) is a .NET/managed debugger. It cannot "
                         f"attach to or debug this native process ({os.path.basename(image)}, PID {pid}); it will "
@@ -3057,11 +3083,18 @@ class DebuggerApp(tk.Tk):
                     self._append_output(f"[debugger] launched: {cmd}\n", "dbg")
                 except OSError as exc:
                     self._append_output(f"[debugger] could not start the debugger ({exc}); attach manually to PID {pid}\n", "dbg")
-            msg.configure(foreground="#1f4fb8", text=(
-                f"Detached. {'Debugger launched for' if launched else 'Attach a NATIVE debugger (WinDbg/x64dbg) to'} "
-                f"PID {pid}. The thread is held suspended the whole time, so the debugger will show it sitting at "
-                f"the frozen address — no breakpoint needed. Press Resume here only once it is attached (or "
-                f"resume its thread yourself: WinDbg ~*m, x64dbg thread list)."))
+            if is_clr:
+                msg.configure(foreground="#1f4fb8", text=(
+                    f"Detached. {'Managed debugger launched for' if launched else 'Attach dnSpy (or WinDbg + SOS) to'} "
+                    f"PID {pid}: Debug > Attach to Process, pick PID {pid}. The thread is held suspended the whole "
+                    f"time, so once attached the process sits exactly where it is — no breakpoint needed before "
+                    f"you set one on the payload's entry point. Press Resume here only once attached."))
+            else:
+                msg.configure(foreground="#1f4fb8", text=(
+                    f"Detached. {'Debugger launched for' if launched else 'Attach a NATIVE debugger (WinDbg/x64dbg) to'} "
+                    f"PID {pid}. The thread is held suspended the whole time, so the debugger will show it sitting at "
+                    f"the frozen address — no breakpoint needed. Press Resume here only once it is attached (or "
+                    f"resume its thread yourself: WinDbg ~*m, x64dbg thread list)."))
             b_handoff.state(["disabled"])
 
         def resume():
@@ -3072,7 +3105,8 @@ class DebuggerApp(tk.Tk):
             session.guard_command("kill", pid)
             win.destroy()
 
-        b_handoff = ttk.Button(btns, text="Hand off to debugger", command=handoff)
+        b_handoff = ttk.Button(btns, text="Hand off to dnSpy / managed debugger" if is_clr else "Hand off to debugger",
+                              command=handoff)
         b_handoff.pack(side="left")
         ttk.Button(btns, text="Resume", command=resume).pack(side="left", padx=6)
         ttk.Button(btns, text="Kill", command=kill).pack(side="left")
@@ -3144,6 +3178,7 @@ class DebuggerApp(tk.Tk):
         guard_var = tk.BooleanVar(value=bool(self.settings.get("guard")))
         gc_var = tk.BooleanVar(value=bool(self.settings.get("guard_created")))
         gf_var = tk.BooleanVar(value=bool(self.settings.get("guard_first", True)))
+        gclr_var = tk.BooleanVar(value=bool(self.settings.get("guard_clr", True)))
         gd_var = tk.BooleanVar(value=bool(self.settings.get("guard_dlls")))
         ttk.Checkbutton(frm, text="Process guard: freeze every new process in the script's tree (children, "
                                   "grandchildren, suspended ones) before it executes and offer it for hand-off",
@@ -3152,12 +3187,17 @@ class DebuggerApp(tk.Tk):
         gfrm = ttk.Frame(frm)
         gfrm.grid(row=6, column=0, columnspan=2, sticky="w", padx=(24, 0))
         ttk.Label(gfrm, text="Freeze each new process:").pack(side="left")
-        ttk.Checkbutton(gfrm, text="at its first instruction", variable=gf_var).pack(side="left", padx=(6, 0))
         ttk.Checkbutton(gfrm, text="at creation", variable=gc_var).pack(side="left", padx=(6, 0))
-        ttk.Checkbutton(gfrm, text="log native DLL loads", variable=gd_var).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(gfrm, text="at its first instruction", variable=gf_var).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(gfrm, text="at .NET/CLR load", variable=gclr_var).pack(side="left", padx=(6, 0))
+        gfrm2 = ttk.Frame(frm)
+        gfrm2.grid(row=7, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(2, 0))
+        ttk.Checkbutton(gfrm2, text="log native DLL loads", variable=gd_var).pack(side="left")
+        ttk.Label(gfrm2, text="(most .NET payloads load clr.dll/coreclr.dll: freeze there and attach dnSpy)",
+                  foreground="#7a8290").pack(side="left", padx=(8, 0))
         gi_var = tk.StringVar(value=self.settings.get("guard_ignore") or "")
         gifrm = ttk.Frame(frm)
-        gifrm.grid(row=7, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(4, 0))
+        gifrm.grid(row=8, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(4, 0))
         ttk.Label(gifrm, text="Never freeze these images (comma-separated):").pack(side="left")
         ttk.Entry(gifrm, textvariable=gi_var, width=36).pack(side="left", padx=(6, 0))
         gtmpl_var = tk.StringVar(value=self.settings.get("guard_template") or "")
@@ -3165,23 +3205,25 @@ class DebuggerApp(tk.Tk):
         for label, tmpl in DEBUGGER_PRESETS:
             if tmpl and tmpl == gtmpl_var.get():
                 gpreset_var.set(label)
-        ttk.Label(frm, text="For process guard hand-off — this freezes a NATIVE process (child, hollowed "
-                           "target), so this MUST be a native debugger (WinDbg or x64dbg), never dnSpy or another "
-                           "managed/.NET debugger: it cannot attach to or stop a native process at all.",
+        ttk.Label(frm, text="For process guard hand-off at creation / first instruction — this freezes a NATIVE "
+                           "process before any .NET runtime is loaded, so this MUST be a native debugger (WinDbg "
+                           "or x64dbg), never dnSpy or another managed/.NET debugger: it cannot attach to or stop "
+                           "a native process at all. A process frozen 'at .NET/CLR load' is handed to the managed "
+                           "debugger configured above instead (dnSpy etc.), since by then the runtime IS loaded.",
                   foreground="#c42c1c", wraplength=620, justify="left").grid(
-            row=8, column=0, columnspan=2, sticky="w", pady=(14, 0))
-        ttk.Label(frm, text="Preset:").grid(row=9, column=0, sticky="w", pady=(6, 0))
+            row=9, column=0, columnspan=2, sticky="w", pady=(14, 0))
+        ttk.Label(frm, text="Preset:").grid(row=10, column=0, sticky="w", pady=(6, 0))
         gpreset = ttk.Combobox(frm, textvariable=gpreset_var, state="readonly", width=44,
                                values=[p[0] for p in DEBUGGER_PRESETS if "dnSpy" not in p[0]])
-        gpreset.grid(row=9, column=1, sticky="w", pady=(6, 0))
+        gpreset.grid(row=10, column=1, sticky="w", pady=(6, 0))
 
         def on_gpreset(event=None):
             for label, tmpl in DEBUGGER_PRESETS:
                 if label == gpreset_var.get() and tmpl:
                     gtmpl_var.set(tmpl)
         gpreset.bind("<<ComboboxSelected>>", on_gpreset)
-        ttk.Label(frm, text="Command:").grid(row=10, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(frm, textvariable=gtmpl_var, width=70).grid(row=10, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(frm, text="Command:").grid(row=11, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(frm, textvariable=gtmpl_var, width=70).grid(row=11, column=1, sticky="w", pady=(6, 0))
         ttk.Label(frm, foreground="#7a8290", justify="left", wraplength=620, text=(
             "WinDbg: .childdbg 1 debugs every child process the script creates (including ones created suspended "
             "for hollowing); sxe cpr breaks on each process creation. Add sxe ld:<name> or bp ntdll!NtMapViewOfSection "
@@ -3190,15 +3232,20 @@ class DebuggerApp(tk.Tk):
             "Loads on background threads cannot pause instantly; they are reported and the script pauses at its "
             "next statement. Changing the assembly-load option takes effect on the next run.\n\n"
             "Process guard: 'first instruction' is the moment a hollowed process has its injected image in place "
-            "and is about to run it; 'creation' is before the creator has touched it. While the guard is on, no "
-            "other debugger can attach to the script process itself (Windows allows one debugger per process); "
-            "handing off a child detaches the guard from that child only. The script process sees "
-            "IsDebuggerPresent() = true. Takes effect on the next run. The thread stays suspended the whole time "
-            "it is frozen, including after hand-off, so whichever debugger attaches will show it sitting at that "
-            "address already — attaching is enough, no breakpoint is needed to 'catch' it.")).grid(
-            row=11, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            "and is about to run it; 'creation' is before the creator has touched it; '.NET/CLR load' is the "
+            "moment clr.dll or coreclr.dll is mapped into the process, which happens for ANY technique that ends "
+            "up running .NET code there (even one that redirects the thread's entry point to skip the native "
+            "'first instruction' trap entirely, since it still has to load the CLR to run managed code) — "
+            "catch it there and dnSpy's Attach to Process works, because the runtime exists but hasn't started "
+            "running the payload yet. While the guard is on, no other debugger can attach to the script process "
+            "itself (Windows allows one debugger per process); handing off a child detaches the guard from that "
+            "child only. The script process sees IsDebuggerPresent() = true. Takes effect on the next run. The "
+            "thread stays suspended the whole time it is frozen, including after hand-off, so whichever debugger "
+            "attaches will show it sitting at that address already — attaching is enough, no breakpoint is "
+            "needed to 'catch' it.")).grid(
+            row=12, column=0, columnspan=2, sticky="w", pady=(10, 0))
         btns = ttk.Frame(frm)
-        btns.grid(row=12, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        btns.grid(row=13, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         def save():
             self.settings["native_template"] = tmpl_var.get().strip()
@@ -3207,6 +3254,7 @@ class DebuggerApp(tk.Tk):
             self.settings["guard"] = bool(guard_var.get())
             self.settings["guard_created"] = bool(gc_var.get())
             self.settings["guard_first"] = bool(gf_var.get())
+            self.settings["guard_clr"] = bool(gclr_var.get())
             self.settings["guard_dlls"] = bool(gd_var.get())
             self.settings["guard_ignore"] = gi_var.get().strip()
             self.settings["guard_template"] = gtmpl_var.get().strip()
