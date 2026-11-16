@@ -850,6 +850,283 @@ exit $__DbgExit
 
 
 # ----------------------------------------------------------------------------
+# Process guard: the GUI acts as the native debugger of the script's whole process
+# tree so that every new process can be frozen before it executes and handed to a
+# real debugger.
+# ----------------------------------------------------------------------------
+
+from ctypes import wintypes  # noqa: E402
+
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_ntdll = ctypes.WinDLL("ntdll")
+DEBUG_PROCESS = 0x00000001
+DBG_CONTINUE = 0x00010002
+DBG_EXCEPTION_NOT_HANDLED = 0x80010001
+EXCEPTION_DEBUG_EVENT = 1
+CREATE_THREAD_DEBUG_EVENT = 2
+CREATE_PROCESS_DEBUG_EVENT = 3
+EXIT_THREAD_DEBUG_EVENT = 4
+EXIT_PROCESS_DEBUG_EVENT = 5
+LOAD_DLL_DEBUG_EVENT = 6
+UNLOAD_DLL_DEBUG_EVENT = 7
+OUTPUT_DEBUG_STRING_EVENT = 8
+BREAKPOINT_CODES = (0x80000003, 0x4000001F)      # EXCEPTION_BREAKPOINT, STATUS_WX86_BREAKPOINT
+THREAD_SUSPEND_RESUME = 0x0002
+PROCESS_TERMINATE = 0x0001
+
+
+class _EXCEPTION_RECORD(ctypes.Structure):
+    _fields_ = [("ExceptionCode", wintypes.DWORD), ("ExceptionFlags", wintypes.DWORD),
+                ("ExceptionRecord", ctypes.c_void_p), ("ExceptionAddress", ctypes.c_void_p),
+                ("NumberParameters", wintypes.DWORD), ("ExceptionInformation", ctypes.c_void_p * 15)]
+
+
+class _EXCEPTION_DEBUG_INFO(ctypes.Structure):
+    _fields_ = [("ExceptionRecord", _EXCEPTION_RECORD), ("dwFirstChance", wintypes.DWORD)]
+
+
+class _CREATE_PROCESS_DEBUG_INFO(ctypes.Structure):
+    _fields_ = [("hFile", wintypes.HANDLE), ("hProcess", wintypes.HANDLE), ("hThread", wintypes.HANDLE),
+                ("lpBaseOfImage", ctypes.c_void_p), ("dwDebugInfoFileOffset", wintypes.DWORD),
+                ("nDebugInfoSize", wintypes.DWORD), ("lpThreadLocalBase", ctypes.c_void_p),
+                ("lpStartAddress", ctypes.c_void_p), ("lpImageName", ctypes.c_void_p), ("fUnicode", wintypes.WORD)]
+
+
+class _LOAD_DLL_DEBUG_INFO(ctypes.Structure):
+    _fields_ = [("hFile", wintypes.HANDLE), ("lpBaseOfDll", ctypes.c_void_p), ("dwDebugInfoFileOffset", wintypes.DWORD),
+                ("nDebugInfoSize", wintypes.DWORD), ("lpImageName", ctypes.c_void_p), ("fUnicode", wintypes.WORD)]
+
+
+class _EXIT_INFO(ctypes.Structure):
+    _fields_ = [("dwExitCode", wintypes.DWORD)]
+
+
+class _DEBUG_EVENT_U(ctypes.Union):
+    _fields_ = [("Exception", _EXCEPTION_DEBUG_INFO), ("CreateProcessInfo", _CREATE_PROCESS_DEBUG_INFO),
+                ("LoadDll", _LOAD_DLL_DEBUG_INFO), ("Exit", _EXIT_INFO), ("_pad", ctypes.c_byte * 160)]
+
+
+class _DEBUG_EVENT(ctypes.Structure):
+    _fields_ = [("dwDebugEventCode", wintypes.DWORD), ("dwProcessId", wintypes.DWORD),
+                ("dwThreadId", wintypes.DWORD), ("u", _DEBUG_EVENT_U)]
+
+
+def _path_from_handle(handle):
+    if not handle:
+        return ""
+    buf = ctypes.create_unicode_buffer(1024)
+    n = _k32.GetFinalPathNameByHandleW(wintypes.HANDLE(handle), buf, 1024, 0)
+    if 0 < n < 1024:
+        p = buf.value
+        return p[4:] if p.startswith("\\\\?\\") else p
+    return ""
+
+
+def _image_of_process(hprocess):
+    buf = ctypes.create_unicode_buffer(1024)
+    size = wintypes.DWORD(1024)
+    if _k32.QueryFullProcessImageNameW(wintypes.HANDLE(hprocess), 0, buf, ctypes.byref(size)):
+        return buf.value
+    return ""
+
+
+def _parent_pid(hprocess):
+    info = (ctypes.c_void_p * 6)()
+    ret = wintypes.ULONG(0)
+    status = _ntdll.NtQueryInformationProcess(wintypes.HANDLE(hprocess), 0, info, ctypes.sizeof(info), ctypes.byref(ret))
+    if status == 0:
+        return int(info[5] or 0)
+    return 0
+
+
+class ProcessGuard:
+    """Runs the script process under DEBUG_PROCESS on a dedicated thread.
+
+    Every process in the tree is tracked. New processes are frozen at the configured
+    stages ('created', 'first') and reported to the GUI as ("guard", stage, info);
+    the GUI answers with resume / detach / kill.
+    """
+
+    STAGE_CREATED = "created"
+    STAGE_FIRST = "first"
+
+    def __init__(self, events, stages, log_dlls=False, ignore=("conhost.exe",)):
+        self.events = events
+        self.stages = set(stages)
+        self.log_dlls = log_dlls
+        self.ignore = {s.strip().lower() for s in ignore if s.strip()}
+        self.cmds = queue.Queue()
+        self.procs = {}           # pid -> dict(image, parent, hprocess, init_bp_pending, frozen, handles)
+        self.root_pid = None
+        self.stop_flag = False
+        self.proc = None
+        self.spawn_error = None
+        self.thread = None
+        self.finished = threading.Event()
+
+    # --- lifecycle ---------------------------------------------------------------
+    def start(self, popen_args, popen_kwargs):
+        ready = threading.Event()
+        self.thread = threading.Thread(target=self._run, args=(popen_args, popen_kwargs, ready), daemon=True)
+        self.thread.start()
+        ready.wait()
+        if self.spawn_error:
+            raise self.spawn_error
+        return self.proc
+
+    def command(self, action, pid):
+        self.cmds.put((action, pid))
+
+    def stop(self):
+        self.stop_flag = True
+
+    # --- debugger thread -------------------------------------------------------------
+    def _run(self, popen_args, popen_kwargs, ready):
+        try:
+            kwargs = dict(popen_kwargs)
+            kwargs["creationflags"] = kwargs.get("creationflags", 0) | DEBUG_PROCESS
+            self.proc = subprocess.Popen(popen_args, **kwargs)
+            self.root_pid = self.proc.pid
+        except Exception as exc:  # noqa: BLE001
+            self.spawn_error = exc
+            ready.set()
+            return
+        ready.set()
+        _k32.DebugSetProcessKillOnExit(False)
+        evt = _DEBUG_EVENT()
+        root_exited = False
+        try:
+            while True:
+                self._serve_commands()
+                if self.stop_flag and not self.procs:
+                    break
+                if root_exited and not self.procs:
+                    break
+                if not _k32.WaitForDebugEvent(ctypes.byref(evt), 100):
+                    if root_exited and not any(p.get("debugged") for p in self.procs.values()):
+                        break
+                    continue
+                code, pid, tid = evt.dwDebugEventCode, evt.dwProcessId, evt.dwThreadId
+                status = DBG_CONTINUE
+                try:
+                    if code == CREATE_PROCESS_DEBUG_EVENT:
+                        self._on_create(pid, tid, evt.u.CreateProcessInfo)
+                    elif code == EXIT_PROCESS_DEBUG_EVENT:
+                        self._on_exit(pid, evt.u.Exit.dwExitCode)
+                        if pid == self.root_pid:
+                            root_exited = True
+                    elif code == LOAD_DLL_DEBUG_EVENT:
+                        info = evt.u.LoadDll
+                        if self.log_dlls and pid != self.root_pid:
+                            self._log(f"[guard] PID {pid} loaded {_path_from_handle(info.hFile) or '<unknown dll>'}")
+                        if info.hFile:
+                            _k32.CloseHandle(info.hFile)
+                    elif code == EXCEPTION_DEBUG_EVENT:
+                        status = self._on_exception(pid, tid, evt.u.Exception)
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"[guard] error handling event {code} for PID {pid}: {exc}")
+                _k32.ContinueDebugEvent(pid, tid, status)
+        finally:
+            self.finished.set()
+
+    def _serve_commands(self):
+        while True:
+            try:
+                action, pid = self.cmds.get_nowait()
+            except queue.Empty:
+                return
+            info = self.procs.get(pid)
+            try:
+                if action == "resume":
+                    self._resume(pid)
+                elif action == "detach":
+                    if info and info.get("debugged"):
+                        if _k32.DebugActiveProcessStop(pid):
+                            info["debugged"] = False
+                            self._log(f"[guard] detached from PID {pid}; it stays frozen until you resume it")
+                        else:
+                            self._log(f"[guard] could not detach from PID {pid} (error {ctypes.get_last_error()})")
+                elif action == "kill":
+                    h = _k32.OpenProcess(PROCESS_TERMINATE, False, pid)
+                    if h:
+                        _k32.TerminateProcess(h, 1)
+                        _k32.CloseHandle(h)
+                    self._resume(pid)
+                    self._log(f"[guard] killed PID {pid}")
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"[guard] {action} PID {pid} failed: {exc}")
+
+    def _resume(self, pid):
+        info = self.procs.get(pid)
+        if not info:
+            return
+        for h in info.get("frozen_threads", []):
+            _k32.ResumeThread(h)
+            _k32.CloseHandle(h)
+        if info.get("frozen_threads"):
+            self._log(f"[guard] resumed PID {pid}")
+        info["frozen_threads"] = []
+        if not info.get("debugged"):
+            self.procs.pop(pid, None)
+
+    def _freeze(self, pid, tid, stage, hthread=None):
+        info = self.procs[pid]
+        if hthread:
+            h = wintypes.HANDLE()
+            if not _k32.DuplicateHandle(_k32.GetCurrentProcess(), wintypes.HANDLE(hthread), _k32.GetCurrentProcess(),
+                                        ctypes.byref(h), THREAD_SUSPEND_RESUME, False, 0):
+                h = None
+            else:
+                h = h.value
+        else:
+            h = _k32.OpenThread(THREAD_SUSPEND_RESUME, False, tid)
+        if not h:
+            self._log(f"[guard] could not freeze PID {pid} (error {ctypes.get_last_error()})")
+            return
+        _k32.SuspendThread(h)
+        info.setdefault("frozen_threads", []).append(h)
+        self.events.put(("guard", stage, {"pid": pid, "tid": tid, "image": info["image"], "parent": info["parent"]}))
+
+    def _on_create(self, pid, tid, cp):
+        image = _path_from_handle(cp.hFile) or _image_of_process(cp.hProcess) or "<unknown image>"
+        parent = _parent_pid(cp.hProcess)
+        self.procs[pid] = {"image": image, "parent": parent, "init_bp_pending": True, "debugged": True,
+                           "frozen_threads": []}
+        if cp.hFile:
+            _k32.CloseHandle(cp.hFile)
+        if pid == self.root_pid:
+            return
+        ignored = os.path.basename(image).lower() in self.ignore
+        self.procs[pid]["ignored"] = ignored
+        note = " [ignored]" if ignored else ""
+        self._log(f"[guard] new process PID {pid}: {image} (created by PID {parent}){note}")
+        if self.STAGE_CREATED in self.stages and not ignored:
+            self._freeze(pid, tid, self.STAGE_CREATED, cp.hThread)
+
+    def _on_exit(self, pid, code):
+        info = self.procs.pop(pid, None)
+        if info and pid != self.root_pid:
+            self._log(f"[guard] PID {pid} exited with code {code} ({os.path.basename(info['image'])})")
+        if info:
+            for h in info.get("frozen_threads", []):
+                _k32.CloseHandle(h)
+
+    def _on_exception(self, pid, tid, ex):
+        code = ex.ExceptionRecord.ExceptionCode
+        info = self.procs.get(pid)
+        if code in BREAKPOINT_CODES:
+            if info and info.get("init_bp_pending"):
+                info["init_bp_pending"] = False
+                if pid != self.root_pid and self.STAGE_FIRST in self.stages and not info.get("ignored"):
+                    self._freeze(pid, tid, self.STAGE_FIRST)
+            return DBG_CONTINUE
+        return DBG_EXCEPTION_NOT_HANDLED
+
+    def _log(self, text):
+        self.events.put(("output", text + "\n"))
+
+
+# ----------------------------------------------------------------------------
 # Debug sessions
 # ----------------------------------------------------------------------------
 
@@ -899,6 +1176,10 @@ class DebugSession:
         self.track = TRACK_POINTS
         self.asm_pause = False              # PowerShell: pause when the script loads an assembly
         self.wait_start = False             # emit 'ready' and wait before running any script code
+        self.guard_stages = ()              # ProcessGuard freeze stages, empty = guard off
+        self.guard_log_dlls = False
+        self.guard_ignore = ("conhost.exe",)
+        self.guard = None
         self.state_dir = tempfile.mkdtemp(prefix="scriptdbg_")
         self.encoding = "utf-8"
         self._stdin_lock = threading.Lock()
@@ -983,17 +1264,19 @@ class DebugSession:
     def start(self):
         cmd, env, cwd = self._build()
         self.write_control()
-        self.proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            cwd=cwd,
-            env=env,
-            creationflags=CREATE_NO_WINDOW,
-        )
+        kwargs = dict(stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                      cwd=cwd, env=env, creationflags=CREATE_NO_WINDOW)
+        if self.guard_stages:
+            self.guard = ProcessGuard(self.events, self.guard_stages, self.guard_log_dlls, self.guard_ignore)
+            self.proc = self.guard.start(cmd, kwargs)
+        else:
+            self.proc = subprocess.Popen(cmd, **kwargs)
         self.started = True
         threading.Thread(target=self._reader, daemon=True).start()
+
+    def guard_command(self, action, pid):
+        if self.guard:
+            self.guard.command(action, pid)
 
     def resume(self, mode, depth_abs=0):
         self.set_mode(mode, depth_abs)
@@ -1019,6 +1302,10 @@ class DebugSession:
 
     def stop(self):
         self.killed = True
+        if self.guard:
+            self.guard.stop()
+            for pid in list(self.guard.procs):
+                self.guard.command("kill", pid)
         if self.proc and self.proc.poll() is None:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(self.proc.pid)],
@@ -1382,7 +1669,9 @@ DEBUGGER_PRESETS = [
     ("dnSpy (then Debug > Attach to Process)", "dnSpy.exe"),
     ("Custom", ""),
 ]
-DEFAULT_SETTINGS = {"native_template": DEBUGGER_PRESETS[0][1], "attach_at_start": False, "asm_pause": False}
+DEFAULT_SETTINGS = {"native_template": DEBUGGER_PRESETS[0][1], "attach_at_start": False, "asm_pause": False,
+                    "guard": False, "guard_created": False, "guard_first": True, "guard_dlls": False,
+                    "guard_ignore": "conhost.exe"}
 
 
 def _settings_path():
@@ -2496,6 +2785,19 @@ class DebuggerApp(tk.Tk):
             self.session.temp_breakpoint = temp_bp
             self.session.asm_pause = bool(self.settings.get("asm_pause")) and self.kind == "powershell"
             self.session.wait_start = bool(self.settings.get("attach_at_start"))
+            if self.settings.get("guard"):
+                stages = []
+                if self.settings.get("guard_created"):
+                    stages.append(ProcessGuard.STAGE_CREATED)
+                if self.settings.get("guard_first", True):
+                    stages.append(ProcessGuard.STAGE_FIRST)
+                self.session.guard_stages = tuple(stages) or (ProcessGuard.STAGE_FIRST,)
+                self.session.guard_log_dlls = bool(self.settings.get("guard_dlls"))
+                self.session.guard_ignore = tuple((self.settings.get("guard_ignore") or "").split(","))
+                if self.session.wait_start and self.settings.get("attach_at_start"):
+                    self._append_output("[debugger] process guard is on: this debugger is the native debugger of "
+                                        "the script process, so no other debugger can attach to it; new child "
+                                        "processes can be handed off instead\n", "dbg")
         self.pending_asm_note = None
         self.vars_table.clear()
         self.history.clear()
@@ -2608,6 +2910,9 @@ class DebuggerApp(tk.Tk):
                                              f"its code may already be running. PID {pid}.")
                     self._append_output(f"[debugger] assembly loaded on background thread {thread}: {name} ({loc}); "
                                         f"pausing at the next statement\n", "dbg")
+        elif kind == "guard":
+            _, stage, info = ev
+            self._on_guard(stage, info)
         elif kind == "stop":
             _, line, depth, variables, paused, stmt_end = ev
             self._apply_variables(line, variables, paused)
@@ -2695,7 +3000,7 @@ class DebuggerApp(tk.Tk):
         self.session.current_line = None
         self.code.set_current(None)
         self._set_state("paused")
-        if self.settings.get("attach_at_start"):
+        if self.settings.get("attach_at_start") and not self.session.guard:
             ok = self.attach_native_debugger()
             if ok:
                 self._status(f"Waiting before the first line. Native debugger launched for PID {pid}: set its "
@@ -2704,10 +3009,71 @@ class DebuggerApp(tk.Tk):
         self._status(f"Waiting before the first line (PID {pid}). Attach a debugger, then Continue (F5) or "
                      f"Step Into (F11).")
 
+    def _on_guard(self, stage, info):
+        """A process in the script's tree is frozen; let the user decide what happens to it."""
+        pid, image, parent = info["pid"], info["image"], info["parent"]
+        when = "at its first instruction (image mapped, nothing executed yet)" if stage == ProcessGuard.STAGE_FIRST \
+            else "at creation (still empty; its creator may inject into it before resuming it)"
+        self._append_output(f"[guard] PID {pid} frozen {when}: {image}\n", "dbg")
+        self._status(f"Process {pid} ({os.path.basename(image)}) frozen {stage}. Decide in the pop-up.")
+        win = tk.Toplevel(self)
+        win.title(f"Process frozen: PID {pid}")
+        win.transient(self)
+        win.attributes("-topmost", True)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=f"{os.path.basename(image)}   (PID {pid}, created by PID {parent})",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(frm, text=image, foreground="#7a8290").pack(anchor="w")
+        ttk.Label(frm, text=f"Frozen {when}.", wraplength=520, justify="left").pack(anchor="w", pady=(8, 0))
+        state = {"detached": False}
+        msg = ttk.Label(frm, text="", wraplength=520, justify="left", foreground="#1f4fb8")
+        msg.pack(anchor="w", pady=(6, 0))
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", pady=(12, 0))
+        session = self.session
+
+        def handoff():
+            session.guard_command("detach", pid)
+            state["detached"] = True
+            template = (self.settings.get("native_template") or "").strip()
+            launched = False
+            if template:
+                cmd = template.replace("{pid}", str(pid))
+                try:
+                    subprocess.Popen(cmd)
+                    launched = True
+                    self._append_output(f"[debugger] launched: {cmd}\n", "dbg")
+                except OSError as exc:
+                    self._append_output(f"[debugger] could not start the debugger ({exc}); attach manually to PID {pid}\n", "dbg")
+            msg.configure(text=(f"Detached. {'Debugger launched for' if launched else 'Attach your debugger to'} PID {pid}. "
+                                f"The process stays frozen until you press Resume here (or resume its thread in the "
+                                f"debugger: WinDbg ~*m, x64dbg thread list)."))
+            b_handoff.state(["disabled"])
+
+        def resume():
+            session.guard_command("resume", pid)
+            win.destroy()
+
+        def kill():
+            session.guard_command("kill", pid)
+            win.destroy()
+
+        b_handoff = ttk.Button(btns, text="Hand off to debugger", command=handoff)
+        b_handoff.pack(side="left")
+        ttk.Button(btns, text="Resume", command=resume).pack(side="left", padx=6)
+        ttk.Button(btns, text="Kill", command=kill).pack(side="left")
+        win.protocol("WM_DELETE_WINDOW", lambda: None)
+
     def attach_native_debugger(self):
         """Launch the configured native debugger against the script's process. Returns True on launch."""
         if not (self.session and self.session.proc and self.session.proc.poll() is None):
             self._status("No running script process to attach to.")
+            return False
+        if self.session.guard:
+            messagebox.showinfo(APP_TITLE, "The process guard is on, so this debugger is already the native debugger "
+                                           "of the script process and another one cannot attach to it. New child "
+                                           "processes are offered for hand-off as they appear.")
             return False
         pid = self.session.proc.pid
         template = (self.settings.get("native_template") or "").strip()
@@ -2760,21 +3126,50 @@ class DebuggerApp(tk.Tk):
         ttk.Checkbutton(frm, text="PowerShell: pause the script the moment it loads an assembly (in-memory loads "
                                   "included), before any of its code runs", variable=asm_var).grid(
             row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        guard_var = tk.BooleanVar(value=bool(self.settings.get("guard")))
+        gc_var = tk.BooleanVar(value=bool(self.settings.get("guard_created")))
+        gf_var = tk.BooleanVar(value=bool(self.settings.get("guard_first", True)))
+        gd_var = tk.BooleanVar(value=bool(self.settings.get("guard_dlls")))
+        ttk.Checkbutton(frm, text="Process guard: run the script as this debugger's debuggee so every new process in "
+                                  "its tree (children, grandchildren, suspended/hollowed ones) is frozen and offered "
+                                  "for hand-off before it executes", variable=guard_var).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        gfrm = ttk.Frame(frm)
+        gfrm.grid(row=6, column=0, columnspan=2, sticky="w", padx=(24, 0))
+        ttk.Label(gfrm, text="Freeze each new process:").pack(side="left")
+        ttk.Checkbutton(gfrm, text="at its first instruction", variable=gf_var).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(gfrm, text="at creation", variable=gc_var).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(gfrm, text="log native DLL loads", variable=gd_var).pack(side="left", padx=(12, 0))
+        gi_var = tk.StringVar(value=self.settings.get("guard_ignore") or "")
+        gifrm = ttk.Frame(frm)
+        gifrm.grid(row=6, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(26, 0))
+        ttk.Label(gifrm, text="Never freeze these images (comma-separated):").pack(side="left")
+        ttk.Entry(gifrm, textvariable=gi_var, width=36).pack(side="left", padx=(6, 0))
         ttk.Label(frm, foreground="#7a8290", justify="left", wraplength=620, text=(
             "WinDbg: .childdbg 1 debugs every child process the script creates (including ones created suspended "
             "for hollowing); sxe cpr breaks on each process creation. Add sxe ld:<name> or bp ntdll!NtMapViewOfSection "
             "etc. as needed. Assemblies loaded from memory never produce a native module-load event, which is what "
             "the assembly-load pause is for. Assemblies from $PSHOME, the Windows folder and the GAC are ignored. "
             "Loads on background threads cannot pause instantly; they are reported and the script pauses at its "
-            "next statement. Changing the assembly-load option takes effect on the next run.")).grid(
-            row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            "next statement. Changing the assembly-load option takes effect on the next run.\n\n"
+            "Process guard: 'first instruction' is the moment a hollowed process has its injected image in place "
+            "and is about to run it; 'creation' is before the creator has touched it. While the guard is on, no "
+            "other debugger can attach to the script process itself (Windows allows one debugger per process); "
+            "handing off a child detaches the guard from that child only. The script process sees "
+            "IsDebuggerPresent() = true. Takes effect on the next run.")).grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
         btns = ttk.Frame(frm)
-        btns.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         def save():
             self.settings["native_template"] = tmpl_var.get().strip()
             self.settings["attach_at_start"] = bool(attach_var.get())
             self.settings["asm_pause"] = bool(asm_var.get())
+            self.settings["guard"] = bool(guard_var.get())
+            self.settings["guard_created"] = bool(gc_var.get())
+            self.settings["guard_first"] = bool(gf_var.get())
+            self.settings["guard_dlls"] = bool(gd_var.get())
+            self.settings["guard_ignore"] = gi_var.get().strip()
             save_settings(self.settings)
             if self.session:
                 self.session.asm_pause = self.settings["asm_pause"] and self.kind == "powershell"

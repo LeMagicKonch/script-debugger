@@ -125,6 +125,18 @@ editing.
 Toggle *Show inherited environment* / *Show automatic variables* to also see the variables that
 were already there before the script started (PATH, `$PSVersionTable`, ...).
 
+   - *Process guard*: the debugger launches the script's process as its own debuggee
+     (Windows `DEBUG_PROCESS`), which automatically covers every descendant: children,
+     grandchildren, and processes created suspended and resumed later. Each new process is
+     frozen at its first instruction (optionally also at creation) and a pop-up offers
+     *Hand off to debugger* (detach from that process, keep it frozen, launch your debugger
+     command against its PID, then *Resume* when your breakpoints are set), *Resume* or
+     *Kill*. Images listed under *Never freeze* (default `conhost.exe`) are only logged.
+     While the guard is on, no other debugger can attach to the script process itself, so
+     it is an alternative to *Attach before the first line*, not an addition to it. The
+     script process sees `IsDebuggerPresent()` as true. `samples\spawn.ps1` demonstrates a
+     child created suspended, resumed, and spawning a grandchild.
+
 ## Analysing hostile scripts
 
 The debugger runs the script for real, in a normal cmd.exe or powershell.exe, with your
