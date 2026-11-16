@@ -3142,7 +3142,7 @@ class DebuggerApp(tk.Tk):
         ttk.Checkbutton(gfrm, text="log native DLL loads", variable=gd_var).pack(side="left", padx=(12, 0))
         gi_var = tk.StringVar(value=self.settings.get("guard_ignore") or "")
         gifrm = ttk.Frame(frm)
-        gifrm.grid(row=6, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(26, 0))
+        gifrm.grid(row=7, column=0, columnspan=2, sticky="w", padx=(24, 0), pady=(4, 0))
         ttk.Label(gifrm, text="Never freeze these images (comma-separated):").pack(side="left")
         ttk.Entry(gifrm, textvariable=gi_var, width=36).pack(side="left", padx=(6, 0))
         ttk.Label(frm, foreground="#7a8290", justify="left", wraplength=620, text=(
@@ -3157,9 +3157,9 @@ class DebuggerApp(tk.Tk):
             "other debugger can attach to the script process itself (Windows allows one debugger per process); "
             "handing off a child detaches the guard from that child only. The script process sees "
             "IsDebuggerPresent() = true. Takes effect on the next run.")).grid(
-            row=7, column=0, columnspan=2, sticky="w", pady=(10, 0))
+            row=8, column=0, columnspan=2, sticky="w", pady=(10, 0))
         btns = ttk.Frame(frm)
-        btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        btns.grid(row=9, column=0, columnspan=2, sticky="e", pady=(12, 0))
 
         def save():
             self.settings["native_template"] = tmpl_var.get().strip()
